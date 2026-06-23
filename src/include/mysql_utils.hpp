@@ -47,6 +47,21 @@ enum class MySQLResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIAL
 
 enum class MySQLConnectorInterface { UNINITIALIZED, BASIC, PREPARED_STATEMENT };
 
+enum class MySQLBackendKind { MYSQL_STANDARD, MARIADB_STANDARD, STARROCKS_LEGACY, MYSQL_LIKE_UNKNOWN };
+
+struct MySQLBackendCapabilities {
+	MySQLBackendKind kind = MySQLBackendKind::MYSQL_LIKE_UNKNOWN;
+	string version;
+	string version_comment;
+	bool supports_prepared_statement = true;
+	bool supports_information_schema_schemata = true;
+	bool supports_text_protocol_result = true;
+
+	bool IsStarRocksLegacy() const {
+		return kind == MySQLBackendKind::STARROCKS_LEGACY;
+	}
+};
+
 class MySQLUtils {
 public:
 	static std::tuple<MySQLConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);

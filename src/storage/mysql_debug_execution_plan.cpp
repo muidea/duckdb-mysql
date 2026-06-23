@@ -92,7 +92,7 @@ static unique_ptr<FunctionData> DebugExecutionPlanBind(ClientContext &context, T
 	names.emplace_back("recommended_index");
 	return_types.push_back(LogicalType::VARCHAR);
 
-	return result;
+	return unique_ptr<FunctionData>(result.release());
 }
 
 static void DebugExecutionPlanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {

@@ -32,7 +32,7 @@ std::unique_ptr<MySQLConnection> MySQLConnectionPool::CreateNewConnection() {
 		CalibrateNetwork(*result);
 	}
 
-	return result;
+	return std::move(result);
 }
 
 bool MySQLConnectionPool::CheckConnectionHealthy(MySQLConnection &conn) {

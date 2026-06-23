@@ -250,6 +250,124 @@ const vector<MySQLField> &MySQLResult::Fields() {
 	return fields;
 }
 
+MySQLTextResult::MySQLTextResult(const std::string &query_p, MySQLResultPtr result_p, idx_t affected_rows_p)
+    : query(query_p), result(std::move(result_p)), affected_rows(affected_rows_p) {
+	if (!result) {
+		vector<LogicalType> empty_types;
+		data_chunk.Initialize(Allocator::DefaultAllocator(), empty_types);
+		exhausted = true;
+		return;
+	}
+
+	auto field_count = mysql_num_fields(result.get());
+	auto mfields = mysql_fetch_fields(result.get());
+	if (field_count > 0 && !mfields) {
+		throw IOException("Failed to fetch text result fields for MySQL query \"%s\"\n", query.c_str());
+	}
+
+	vector<LogicalType> ltypes;
+	fields.reserve(field_count);
+	ltypes.reserve(field_count);
+	MySQLTypeConfig type_config;
+	for (idx_t i = 0; i < field_count; i++) {
+		auto &mf = mfields[i];
+		MySQLField field(&mf, LogicalType::VARCHAR, type_config);
+		fields.push_back(std::move(field));
+		ltypes.push_back(LogicalType::VARCHAR);
+	}
+	data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
+}
+
+void MySQLTextResult::CheckColumnIdx(idx_t col) {
+	if (col >= data_chunk.ColumnCount()) {
+		throw IOException("Column: %zu out of range of field count: %zu, MySQL query \"%s\"\n", col,
+		                  data_chunk.ColumnCount(), query.c_str());
+	}
+}
+
+void MySQLTextResult::CheckNotNull(idx_t col) {
+	if (IsNull(col)) {
+		throw InternalException("Get called for a NULL value, column: %zu, MySQL query \"%s\"\n", col, query.c_str());
+	}
+}
+
+string MySQLTextResult::GetString(idx_t col) {
+	CheckNotNull(col);
+	Vector &vec = data_chunk.data[col];
+	string_t *data = FlatVector::GetData<string_t>(vec);
+	string_t &st = data[row_idx];
+	return string(st.GetData(), st.GetSize());
+}
+
+int32_t MySQLTextResult::GetInt32(idx_t col) {
+	return NumericCast<int32_t>(GetInt64(col));
+}
+
+int64_t MySQLTextResult::GetInt64(idx_t col) {
+	CheckNotNull(col);
+	return std::atoll(GetString(col).c_str());
+}
+
+bool MySQLTextResult::IsNull(idx_t col) {
+	CheckColumnIdx(col);
+	Vector &vec = data_chunk.data[col];
+	return FlatVector::IsNull(vec, row_idx);
+}
+
+DataChunk &MySQLTextResult::NextChunk() {
+	data_chunk.Reset();
+	row_idx = 0;
+
+	if (!result) {
+		exhausted = true;
+		data_chunk.SetCardinality(0);
+		return data_chunk;
+	}
+
+	idx_t r = 0;
+	for (; r < STANDARD_VECTOR_SIZE; r++) {
+		auto row = mysql_fetch_row(result.get());
+		if (!row) {
+			exhausted = true;
+			break;
+		}
+		auto lengths = mysql_fetch_lengths(result.get());
+		if (!lengths && data_chunk.ColumnCount() > 0) {
+			throw IOException("Failed to fetch text result lengths for MySQL query \"%s\"\n", query.c_str());
+		}
+		for (idx_t c = 0; c < data_chunk.ColumnCount(); c++) {
+			auto &vec = data_chunk.data[c];
+			if (!row[c]) {
+				FlatVector::SetNull(vec, r, true);
+				continue;
+			}
+			auto value = StringVector::AddStringOrBlob(vec, row[c], lengths[c]);
+			FlatVector::GetData<string_t>(vec)[r] = value;
+		}
+	}
+
+	data_chunk.SetCardinality(r);
+	return data_chunk;
+}
+
+bool MySQLTextResult::Next() {
+	if (row_idx < data_chunk.size() - 1) {
+		row_idx += 1;
+		return true;
+	}
+	NextChunk();
+	row_idx = 0;
+	return data_chunk.size() > 0;
+}
+
+bool MySQLTextResult::Exhausted() {
+	return exhausted;
+}
+
+const vector<MySQLField> &MySQLTextResult::Fields() {
+	return fields;
+}
+
 bool MySQLResult::TryCancelQuery() {
 	if (connection_string.empty()) {
 		return false;

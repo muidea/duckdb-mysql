@@ -48,6 +48,8 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 		} else {
 			return LogicalType::BIGINT;
 		}
+	} else if (type_info.type_name == "largeint") {
+		return LogicalType::VARCHAR;
 	} else if (type_info.type_name == "float") {
 		return LogicalType::FLOAT;
 	} else if (type_info.type_name == "double") {
@@ -75,13 +77,17 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 		return LogicalType::TIMESTAMP;
 	} else if (type_info.type_name == "year") {
 		return LogicalType::INTEGER;
-	} else if (type_info.type_name == "datetime") {
+	} else if (type_info.type_name == "datetime" || type_info.type_name == "datetimev2") {
 		return LogicalType::TIMESTAMP;
-	} else if (type_info.type_name == "decimal") {
+	} else if (type_info.type_name == "decimal" || type_info.type_name == "decimalv2" ||
+	           type_info.type_name == "decimal32" || type_info.type_name == "decimal64" ||
+	           type_info.type_name == "decimal128") {
 		if (type_info.precision > 0 && type_info.precision <= 38) {
 			return LogicalType::DECIMAL(type_info.precision, type_info.scale);
 		}
 		return LogicalType::DOUBLE;
+	} else if (type_info.type_name == "boolean") {
+		return LogicalType::BOOLEAN;
 	} else if (type_info.type_name == "json") {
 		// FIXME
 		return LogicalType::VARCHAR;
@@ -104,9 +110,12 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 	           type_info.type_name == "multipoint" || type_info.type_name == "multilinestring" ||
 	           type_info.type_name == "multipolygon" || type_info.type_name == "geomcollection") {
 		return LogicalType::BLOB;
-	} else if (type_info.type_name == "varchar" || type_info.type_name == "mediumtext" ||
+	} else if (type_info.type_name == "varchar" || type_info.type_name == "string" ||
+	           type_info.type_name == "mediumtext" ||
 	           type_info.type_name == "longtext" || type_info.type_name == "text" || type_info.type_name == "enum" ||
 	           type_info.type_name == "char") {
+		return LogicalType::VARCHAR;
+	} else if (type_info.type_name == "array" || type_info.type_name == "map" || type_info.type_name == "struct") {
 		return LogicalType::VARCHAR;
 	}
 	// fallback for unknown types

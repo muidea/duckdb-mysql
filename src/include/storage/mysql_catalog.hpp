@@ -71,6 +71,7 @@ public:
 	MySQLConnectionPool &GetConnectionPool();
 	PlanCache &GetPlanCache();
 	MySQLStatsCache &GetStatsCache();
+	const MySQLBackendCapabilities &GetBackendCapabilities();
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
@@ -81,6 +82,7 @@ private:
 	shared_ptr<MySQLConnectionPool> connection_pool;
 	PlanCache plan_cache_;
 	MySQLStatsCache stats_cache_;
+	MySQLBackendCapabilities backend_capabilities_;
 };
 
 } // namespace duckdb

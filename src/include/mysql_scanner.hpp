@@ -58,12 +58,19 @@ struct MySQLQueryBindData : public FunctionData {
 	    : query(std::move(query_p)), catalog(catalog), pooled_connection(), result(std::move(result_p)) {
 	}
 
+	MySQLQueryBindData(string query_p, Catalog &catalog, MySQLPooledConnection pooled_connection_p,
+	                   bool use_text_protocol_p)
+	    : query(std::move(query_p)), catalog(catalog), pooled_connection(std::move(pooled_connection_p)),
+	      use_text_protocol(use_text_protocol_p) {
+	}
+
 	string query;
 	Catalog &catalog;
 	MySQLPooledConnection pooled_connection;
-	unique_ptr<MySQLResult> result;
+	unique_ptr<MySQLResultReader> result;
 	unique_ptr<MySQLStatement> stmt;
 	vector<Value> params;
+	bool use_text_protocol = false;
 
 public:
 	unique_ptr<FunctionData> Copy() const override {

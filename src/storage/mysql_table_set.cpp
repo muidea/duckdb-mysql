@@ -12,6 +12,7 @@
 
 #include "storage/mysql_transaction.hpp"
 #include "storage/mysql_schema_entry.hpp"
+#include "storage/mysql_catalog.hpp"
 
 #include "mysql_types.hpp"
 
@@ -49,7 +50,81 @@ void MySQLTableSet::AddColumn(ClientContext &context, MySQLResult &result, MySQL
 	create_info.columns.AddColumn(std::move(column));
 }
 
+static void ParseStarRocksType(const string &raw_type, MySQLTypeData &type_info) {
+	auto column_type = StringUtil::Lower(raw_type);
+	type_info.column_type = column_type;
+	auto paren = column_type.find('(');
+	type_info.type_name = paren == string::npos ? column_type : column_type.substr(0, paren);
+	StringUtil::Trim(type_info.type_name);
+
+	if (paren == string::npos) {
+		return;
+	}
+	auto close = column_type.find(')', paren + 1);
+	if (close == string::npos) {
+		return;
+	}
+	auto args = column_type.substr(paren + 1, close - paren - 1);
+	auto comma = args.find(',');
+	try {
+		if (comma == string::npos) {
+			type_info.precision = std::stoll(args);
+		} else {
+			type_info.precision = std::stoll(args.substr(0, comma));
+			type_info.scale = std::stoll(args.substr(comma + 1));
+		}
+	} catch (...) {
+		type_info.precision = -1;
+		type_info.scale = -1;
+	}
+}
+
+static void AddStarRocksColumn(ClientContext &context, MySQLTextResult &result, MySQLTableInfo &table_info) {
+	MySQLTypeData type_info;
+	auto column_name = result.GetString(0);
+	ParseStarRocksType(result.GetString(1), type_info);
+	auto is_nullable = result.GetString(3);
+
+	auto column_type = MySQLTypes::TypeToLogicalType({context}, type_info);
+	ColumnDefinition column(std::move(column_name), std::move(column_type));
+	auto &create_info = *table_info.create_info;
+	if (!StringUtil::CIEquals(is_nullable, "YES")) {
+		auto column_idx = create_info.columns.LogicalColumnCount();
+		create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(column_idx)));
+	}
+	create_info.columns.AddColumn(std::move(column));
+}
+
+static unique_ptr<MySQLTableInfo> GetStarRocksTableInfo(ClientContext &context, MySQLSchemaEntry &schema,
+                                                        MySQLConnection &connection, const string &table_name) {
+	auto table_info = make_uniq<MySQLTableInfo>(schema, table_name);
+	string query = "SHOW FULL COLUMNS FROM ";
+	query += MySQLUtils::WriteIdentifier(schema.name);
+	query += ".";
+	query += MySQLUtils::WriteIdentifier(table_name);
+	auto result = connection.QueryText(query);
+	while (result->Next()) {
+		AddStarRocksColumn(context, *result, *table_info);
+	}
+	return table_info;
+}
+
 void MySQLTableSet::LoadEntries(ClientContext &context) {
+	auto &mysql_catalog = catalog.Cast<MySQLCatalog>();
+	if (mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy()) {
+		auto acquire_mode = MySQLConnectionPool::GetAcquireMode(context);
+		auto connection = mysql_catalog.GetConnectionPool().Acquire(acquire_mode);
+		string query = "SHOW TABLES FROM " + MySQLUtils::WriteIdentifier(schema.name);
+		auto result = connection.GetConnection().QueryText(query);
+		while (result->Next()) {
+			auto table_name = result->GetString(0);
+			auto table_info = GetStarRocksTableInfo(context, schema, connection.GetConnection(), table_name);
+			auto table_entry = make_uniq<MySQLTableEntry>(catalog, schema, *table_info);
+			CreateEntry(std::move(table_entry));
+		}
+		return;
+	}
+
 	auto query = StringUtil::Replace(R"(
 SELECT table_name, column_name, data_type, column_type, column_default, is_nullable, numeric_precision, numeric_scale
 FROM information_schema.columns
@@ -96,6 +171,13 @@ ORDER BY table_name, ordinal_position;
 
 unique_ptr<MySQLTableInfo> MySQLTableSet::GetTableInfo(ClientContext &context, MySQLSchemaEntry &schema,
                                                        const string &table_name) {
+	auto &mysql_catalog = schema.ParentCatalog().Cast<MySQLCatalog>();
+	if (mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy()) {
+		auto acquire_mode = MySQLConnectionPool::GetAcquireMode(context);
+		auto connection = mysql_catalog.GetConnectionPool().Acquire(acquire_mode);
+		return GetStarRocksTableInfo(context, schema, connection.GetConnection(), table_name);
+	}
+
 	auto &transaction = MySQLTransaction::Get(context, schema.ParentCatalog());
 	auto query = GetTableInfoQuery(schema.name, table_name);
 	auto result = transaction.Query(query);

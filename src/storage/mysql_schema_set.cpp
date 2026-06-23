@@ -1,5 +1,6 @@
 #include "storage/mysql_schema_set.hpp"
 #include "storage/mysql_transaction.hpp"
+#include "storage/mysql_catalog.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 
 namespace duckdb {
@@ -15,6 +16,21 @@ MySQLSchemaSet::MySQLSchemaSet(Catalog &catalog) : MySQLCatalogSet(catalog) {
 }
 
 void MySQLSchemaSet::LoadEntries(ClientContext &context) {
+	auto &mysql_catalog = catalog.Cast<MySQLCatalog>();
+	if (mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy()) {
+		auto acquire_mode = MySQLConnectionPool::GetAcquireMode(context);
+		auto connection = mysql_catalog.GetConnectionPool().Acquire(acquire_mode);
+		auto result = connection.GetConnection().QueryText("SHOW DATABASES");
+		while (result->Next()) {
+			CreateSchemaInfo info;
+			info.schema = result->GetString(0);
+			info.internal = MySQLSchemaIsInternal(info.schema);
+			auto schema = make_uniq<MySQLSchemaEntry>(catalog, info);
+			CreateEntry(std::move(schema));
+		}
+		return;
+	}
+
 	auto query = R"(
 SELECT schema_name
 FROM information_schema.schemata;

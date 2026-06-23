@@ -1,6 +1,7 @@
 #include "mysql_connection.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
@@ -146,6 +147,23 @@ unique_ptr<MySQLResult> MySQLConnection::Query(const string &query, const vector
 	return QueryInternal(query, params, streaming, MySQLConnectorInterface::PREPARED_STATEMENT);
 }
 
+unique_ptr<MySQLTextResult> MySQLConnection::QueryText(const string &query) {
+	if (MySQLConnection::DebugPrintQueries()) {
+		Printer::Print(query + "\n");
+	}
+
+	lock_guard<mutex> l(query_lock);
+	auto con = GetConn();
+	int res_query = mysql_real_query(con, query.c_str(), query.size());
+	if (res_query != 0) {
+		throw IOException("Failed to run text protocol MySQL query \"%s\": %s\n", query.c_str(), mysql_error(con));
+	}
+
+	auto result = MySQLResultPtr(mysql_store_result(con), MySQLResultDelete);
+	auto affected_rows = mysql_affected_rows(con);
+	return make_uniq<MySQLTextResult>(query, std::move(result), affected_rows);
+}
+
 unique_ptr<MySQLResult> MySQLConnection::Query(MySQLStatement &stmt, const vector<Value> &params,
                                                MySQLResultStreaming streaming) {
 
@@ -177,6 +195,86 @@ unique_ptr<MySQLStatement> MySQLConnection::Prepare(const string &query) {
 	}
 
 	return make_uniq<MySQLStatement>(query, stmt.release(), std::move(fields));
+}
+
+static bool IsStarRocksVersion(const string &input) {
+	return StringUtil::Contains(StringUtil::Lower(input), "starrocks");
+}
+
+static int ParseMajorVersion(const string &version) {
+	auto dot = version.find('.');
+	auto major_text = dot == string::npos ? version : version.substr(0, dot);
+	try {
+		return std::stoi(major_text);
+	} catch (...) {
+		return -1;
+	}
+}
+
+MySQLBackendCapabilities MySQLConnection::DetectBackendCapabilities() {
+	MySQLBackendCapabilities caps;
+	auto con = GetConn();
+	MySQLConnectionParameters connection_params;
+	unordered_set<string> unused;
+	std::tie(connection_params, unused) = MySQLUtils::ParseConnectionParameters(connection_string);
+	auto server_info = mysql_get_server_info(con);
+	if (server_info) {
+		caps.version = server_info;
+	}
+
+	auto read_scalar_text = [&](const string &sql) -> string {
+		int res_query = mysql_real_query(con, sql.c_str(), sql.size());
+		if (res_query != 0) {
+			return string();
+		}
+		auto result = MySQLResultPtr(mysql_store_result(con), MySQLResultDelete);
+		if (!result) {
+			return string();
+		}
+		auto row = mysql_fetch_row(result.get());
+		if (!row || !row[0]) {
+			return string();
+		}
+		return row[0];
+	};
+	auto text_query_succeeds = [&](const string &sql) -> bool {
+		int res_query = mysql_real_query(con, sql.c_str(), sql.size());
+		if (res_query != 0) {
+			return false;
+		}
+		auto result = MySQLResultPtr(mysql_store_result(con), MySQLResultDelete);
+		return true;
+	};
+
+	string version = read_scalar_text("SELECT VERSION()");
+	if (!version.empty()) {
+		caps.version = version;
+	}
+	caps.version_comment = read_scalar_text("SELECT @@version_comment");
+	string current_version = read_scalar_text("SELECT current_version()");
+	bool starrocks_show_frontends = text_query_succeeds("SHOW FRONTENDS");
+	bool starrocks_port_hint = connection_params.port == 9030 && StringUtil::StartsWith(caps.version, "5.1");
+
+	bool starrocks_version_text = IsStarRocksVersion(caps.version) || IsStarRocksVersion(caps.version_comment) ||
+	                              IsStarRocksVersion(current_version);
+	if (starrocks_version_text || starrocks_show_frontends || starrocks_port_hint) {
+		auto starrocks_major = !current_version.empty() ? ParseMajorVersion(current_version) : ParseMajorVersion(caps.version);
+		if (starrocks_port_hint || starrocks_show_frontends || (starrocks_major >= 0 && starrocks_major < 3)) {
+			caps.kind = MySQLBackendKind::STARROCKS_LEGACY;
+			caps.supports_prepared_statement = false;
+			caps.supports_information_schema_schemata = false;
+			return caps;
+		}
+		caps.kind = MySQLBackendKind::MYSQL_LIKE_UNKNOWN;
+	}
+
+	if (StringUtil::Contains(StringUtil::Lower(caps.version), "mariadb") ||
+	    StringUtil::Contains(StringUtil::Lower(caps.version_comment), "mariadb")) {
+		caps.kind = MySQLBackendKind::MARIADB_STANDARD;
+	} else if (caps.kind == MySQLBackendKind::MYSQL_LIKE_UNKNOWN) {
+		caps.kind = MySQLBackendKind::MYSQL_STANDARD;
+	}
+	return caps;
 }
 
 void MySQLConnection::Execute(const string &query) {

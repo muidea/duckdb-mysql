@@ -69,7 +69,9 @@ public:
 	unique_ptr<MySQLResult> Query(const string &query, MySQLResultStreaming streaming);
 	unique_ptr<MySQLResult> Query(const string &query, const vector<Value> &params, MySQLResultStreaming streaming);
 	unique_ptr<MySQLResult> Query(MySQLStatement &stmt, const vector<Value> &params, MySQLResultStreaming streaming);
+	unique_ptr<MySQLTextResult> QueryText(const string &query);
 	unique_ptr<MySQLStatement> Prepare(const string &query);
+	MySQLBackendCapabilities DetectBackendCapabilities();
 
 	vector<IndexInfo> GetIndexInfo(const string &table_name);
 

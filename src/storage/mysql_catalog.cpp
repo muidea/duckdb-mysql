@@ -28,7 +28,7 @@ MySQLCatalog::MySQLCatalog(AttachedDatabase &db_p, string connection_string_p, s
 	    [this](const string &schema, const string &table) { plan_cache_.InvalidateTable(schema, table); });
 
 	auto pooled = connection_pool->ForceAcquire();
-	(void)pooled;
+	backend_capabilities_ = pooled.GetConnection().DetectBackendCapabilities();
 }
 
 MySQLCatalog::~MySQLCatalog() = default;
@@ -536,6 +536,10 @@ PlanCache &MySQLCatalog::GetPlanCache() {
 
 MySQLStatsCache &MySQLCatalog::GetStatsCache() {
 	return stats_cache_;
+}
+
+const MySQLBackendCapabilities &MySQLCatalog::GetBackendCapabilities() {
+	return backend_capabilities_;
 }
 
 } // namespace duckdb
