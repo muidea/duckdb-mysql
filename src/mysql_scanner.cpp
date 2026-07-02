@@ -62,6 +62,13 @@ struct MySQLGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+static MySQLResultStreaming ResolveScanStreaming(const MySQLBindData &bind_data) {
+	if (bind_data.streaming == MySQLResultStreaming::ALLOW_STREAMING) {
+		return MySQLResultStreaming::ALLOW_STREAMING;
+	}
+	return MySQLResultStreaming::FORCE_MATERIALIZATION;
+}
+
 static unique_ptr<FunctionData> MySQLBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	throw InternalException("MySQLBind");
@@ -372,6 +379,7 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 	auto use_text_protocol = mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy();
 
 	if (bind_data.has_aggregate_pushdown) {
+		auto scan_streaming = ResolveScanStreaming(bind_data);
 		auto build_aggregate_query = [&]() {
 			string sql = "SELECT " + bind_data.aggregate_select_list;
 			sql += " FROM ";
@@ -403,13 +411,13 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 		agg_fed.execution_plan.estimated_cost.cpu_cost = static_cast<double>(MIN_QUERY_TIMEOUT_MS);
 		InjectQueryHints(context, select, agg_fed, bind_data, con, mysql_catalog.GetStatsCache());
 		try {
-			auto query_result = con.Query(select, MySQLResultStreaming::FORCE_MATERIALIZATION);
+			auto query_result = con.Query(select, scan_streaming);
 			return unique_ptr<GlobalTableFunctionState>(new MySQLGlobalState(std::move(query_result)));
 		} catch (std::bad_alloc &) {
 			throw;
 		} catch (std::exception &) {
 			string fallback = build_aggregate_query();
-			auto query_result = con.Query(fallback, MySQLResultStreaming::FORCE_MATERIALIZATION);
+			auto query_result = con.Query(fallback, scan_streaming);
 			return unique_ptr<GlobalTableFunctionState>(new MySQLGlobalState(std::move(query_result)));
 		}
 	}
@@ -512,7 +520,7 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 	if (use_text_protocol) {
 		query_result = con.QueryText(select);
 	} else {
-		query_result = con.Query(select, MySQLResultStreaming::FORCE_MATERIALIZATION);
+		query_result = con.Query(select, ResolveScanStreaming(bind_data));
 	}
 	unique_ptr<GlobalTableFunctionState> result(new MySQLGlobalState(std::move(query_result)));
 	auto &mysql_state = result->Cast<MySQLGlobalState>();

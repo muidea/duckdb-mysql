@@ -175,8 +175,20 @@ static bool ReadBooleanOption(ClientContext &ctx, const std::string &name, bool 
 	return default_val;
 }
 
+static dbconnector::pool::AcquireMode ReadAcquireModeOption(ClientContext &ctx, const std::string &name,
+                                                            dbconnector::pool::AcquireMode default_val) {
+	Value val;
+	if (ctx.TryGetCurrentSetting(name, val)) {
+		return dbconnector::pool::AcquireModeHelpers::FromString(StringUtil::Lower(val.ToString()));
+	}
+	return default_val;
+}
+
 dbconnector::pool::ConnectionPoolConfig MySQLConnectionPool::CreateConfig(ClientContext &ctx) {
 	dbconnector::pool::ConnectionPoolConfig config;
+	config.acquire_mode = dbconnector::pool::AcquireMode::WAIT;
+	config.tl_cache_enabled = true;
+	config.acquire_mode = ReadAcquireModeOption(ctx, "mysql_pool_acquire_mode", config.acquire_mode);
 	config.max_connections = ReadUBigIntOption(ctx, "mysql_pool_size", config.max_connections);
 	config.wait_timeout_millis = ReadUBigIntOption(ctx, "mysql_pool_wait_timeout_millis", config.wait_timeout_millis);
 	config.tl_cache_enabled = ReadBooleanOption(ctx, "mysql_pool_enable_thread_local_cache", config.tl_cache_enabled);
@@ -225,7 +237,7 @@ dbconnector::pool::AcquireMode MySQLConnectionPool::GetAcquireMode(ClientContext
 		auto mode_str = StringUtil::Lower(mode_val.ToString());
 		return dbconnector::pool::AcquireModeHelpers::FromString(mode_str);
 	}
-	return dbconnector::pool::AcquireMode::FORCE;
+	return dbconnector::pool::AcquireMode::WAIT;
 }
 
 } // namespace duckdb

@@ -20,6 +20,19 @@ static void SetMySQLDebugQueryPrint(ClientContext &context, SetScope scope, Valu
 	MySQLConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
 }
 
+template <typename Fn>
+static void ForEachMySQLCatalog(ClientContext &context, Fn &&fn) {
+	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	for (auto &db_ref : databases) {
+		auto &db = *db_ref;
+		auto &catalog = db.GetCatalog();
+		if (catalog.GetCatalogType() != "mysql") {
+			continue;
+		}
+		fn(catalog.Cast<MySQLCatalog>());
+	}
+}
+
 static void ValidatePoolSize(ClientContext &context, SetScope scope, Value &parameter) {
 	auto new_size = parameter.GetValue<uint64_t>();
 	if (new_size == 0) {
@@ -49,6 +62,50 @@ static void ValidatePoolAcquireMode(ClientContext &context, SetScope scope, Valu
 			}
 		}
 	}
+}
+
+static void SetMySQLPoolSize(ClientContext &context, SetScope scope, Value &parameter) {
+	ValidatePoolSize(context, scope, parameter);
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("mysql_pool_size can only be set globally");
+	}
+	auto new_max = parameter.GetValue<uint64_t>();
+	ForEachMySQLCatalog(context, [&](MySQLCatalog &catalog) { catalog.GetConnectionPool().SetMaxConnections(new_max); });
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("mysql_pool_size", parameter);
+}
+
+static void SetMySQLPoolAcquireMode(ClientContext &context, SetScope scope, Value &parameter) {
+	ValidatePoolAcquireMode(context, scope, parameter);
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("mysql_pool_acquire_mode can only be set globally");
+	}
+	auto mode = StringUtil::Lower(parameter.ToString());
+	ForEachMySQLCatalog(context, [&](MySQLCatalog &catalog) { catalog.GetConnectionPool().SetAcquireMode(mode); });
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("mysql_pool_acquire_mode", Value(mode));
+}
+
+static void SetMySQLPoolWaitTimeoutMillis(ClientContext &context, SetScope scope, Value &parameter) {
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("mysql_pool_wait_timeout_millis can only be set globally");
+	}
+	auto timeout_millis = parameter.GetValue<uint64_t>();
+	ForEachMySQLCatalog(context,
+	                    [&](MySQLCatalog &catalog) { catalog.GetConnectionPool().SetWaitTimeoutMillis(timeout_millis); });
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("mysql_pool_wait_timeout_millis", parameter);
+}
+
+static void SetMySQLPoolThreadLocalCache(ClientContext &context, SetScope scope, Value &parameter) {
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("mysql_pool_enable_thread_local_cache can only be set globally");
+	}
+	auto enabled = BooleanValue::Get(parameter);
+	ForEachMySQLCatalog(context,
+	                    [&](MySQLCatalog &catalog) { catalog.GetConnectionPool().SetThreadLocalCacheEnabled(enabled); });
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("mysql_pool_enable_thread_local_cache", parameter);
 }
 
 static void ValidateUnitInterval(ClientContext &context, SetScope scope, Value &parameter) {
@@ -151,6 +208,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 
 	dbconnector::pool::ConnectionPoolConfig default_pool_config;
+	default_pool_config.acquire_mode = dbconnector::pool::AcquireMode::WAIT;
+	default_pool_config.tl_cache_enabled = true;
 	auto &config = DBConfig::GetConfig(db);
 	StorageExtension::Register(config, "mysql_scanner", make_shared_ptr<MySQLStorageExtension>());
 
@@ -179,10 +238,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption(
 	    "mysql_pool_size",
 	    "Maximum number of connections per MySQL catalog (default: min(cpu_count, 4 <= cpu_count * 1.5 <= 32))",
-	    LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections), ValidatePoolSize);
+	    LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections), SetMySQLPoolSize);
 	config.AddExtensionOption("mysql_pool_wait_timeout_millis",
 	                          "Timeout in milliseconds when waiting for a connection from the pool (default: 30000)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.wait_timeout_millis));
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.wait_timeout_millis),
+	                          SetMySQLPoolWaitTimeoutMillis);
 	config.AddExtensionOption("mysql_pool_connection_max_lifetime_millis",
 	                          "Maximum age in milliseconds of a pooled connection since it was first opened. When "
 	                          "exceeded, the connection is closed instead of being returned to the cache (default: 0 - "
@@ -201,11 +261,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "How to acquire connections from the pool: 'force' (always connect, ignore pool limit), "
 	    "'wait' (block until available), 'try' (fail immediately if unavailable) (default: force)",
 	    LogicalType::VARCHAR, Value(dbconnector::pool::AcquireModeHelpers::ToString(default_pool_config.acquire_mode)),
-	    ValidatePoolAcquireMode);
+	    SetMySQLPoolAcquireMode);
 	config.AddExtensionOption(
 	    "mysql_pool_enable_thread_local_cache",
 	    "Enable thread-local connection caching for faster same-thread connection reuse (default: false)",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.tl_cache_enabled));
+	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.tl_cache_enabled), SetMySQLPoolThreadLocalCache);
 	config.AddExtensionOption("mysql_compression_aware_costs",
 	                          "Apply compression ratios when estimating transfer costs (default: true)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
