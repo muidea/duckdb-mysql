@@ -85,9 +85,7 @@ struct MySQLHistogramBucket {
 struct MySQLHistogram {
 	string column_name;
 	string histogram_type;
-	idx_t num_buckets = 0;
 	idx_t null_count = 0;
-	double sampling_rate = 1.0;
 	vector<Value> bucket_bounds;
 	vector<MySQLHistogramBucket> buckets;
 
@@ -190,6 +188,7 @@ public:
 
 	void Clear();
 	void Invalidate(const string &schema, const string &table);
+	idx_t AuxiliaryQueueSize() const;
 
 private:
 	InvalidationCallback invalidation_callback_;

@@ -95,10 +95,12 @@ bool PlanCache::GetCachedPlan(const ExecutionPlanCacheKey &key, CachedExecutionP
 	}
 
 	auto &cached = it->second;
-	auto now = std::chrono::steady_clock::now();
+	auto now = clock_();
 	auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - cached.cached_at).count();
 	if (static_cast<idx_t>(elapsed) >= PLAN_CACHE_TTL_SECONDS) {
 		cache_.erase(it);
+		ForgetReplanHistory(key);
+		CompactEvictionQueue();
 		return false;
 	}
 
@@ -110,12 +112,13 @@ bool PlanCache::GetCachedPlan(const ExecutionPlanCacheKey &key, CachedExecutionP
 idx_t PlanCache::CachePlan(const ExecutionPlanCacheKey &key, const ExecutionPlan &plan) {
 	lock_guard<std::mutex> lock(mutex_);
 
+	PruneReplanHistory();
 	auto seq = next_eviction_seq_++;
 
 	auto it = cache_.find(key);
 	if (it != cache_.end()) {
 		it->second.plan = plan;
-		it->second.cached_at = std::chrono::steady_clock::now();
+		it->second.cached_at = clock_();
 		it->second.hit_count = 0;
 		it->second.smoothed_actual_rows = 0;
 		it->second.execution_count = 0;
@@ -133,6 +136,7 @@ idx_t PlanCache::CachePlan(const ExecutionPlanCacheKey &key, const ExecutionPlan
 		if (eviction_queue_.empty()) {
 			auto oldest = cache_.begin();
 			if (oldest != cache_.end()) {
+				ForgetReplanHistory(oldest->first);
 				cache_.erase(oldest);
 			}
 			break;
@@ -142,7 +146,7 @@ idx_t PlanCache::CachePlan(const ExecutionPlanCacheKey &key, const ExecutionPlan
 
 	CachedExecutionPlan cached;
 	cached.plan = plan;
-	cached.cached_at = std::chrono::steady_clock::now();
+	cached.cached_at = clock_();
 	cached.plan_generation = generation_;
 	cached.eviction_seq = seq;
 	cache_.emplace(key, std::move(cached));
@@ -150,6 +154,7 @@ idx_t PlanCache::CachePlan(const ExecutionPlanCacheKey &key, const ExecutionPlan
 	entry.key = key;
 	entry.seq = seq;
 	eviction_queue_.push_back(std::move(entry));
+	CompactEvictionQueue();
 	return generation_;
 }
 
@@ -180,10 +185,11 @@ bool PlanCache::UpdatePlanFeedback(const ExecutionPlanCacheKey &key, idx_t actua
 	}
 	cached.execution_count++;
 
+	PruneReplanHistory();
 	idx_t replan_count = 0;
 	auto rc_it = replan_counts_.find(key);
 	if (rc_it != replan_counts_.end()) {
-		replan_count = rc_it->second;
+		replan_count = rc_it->second.count;
 	}
 	idx_t replan_threshold = MIN_EXECUTIONS_FOR_REPLAN;
 	for (idx_t i = 0; i < replan_count && replan_threshold < 1000; i++) {
@@ -194,8 +200,9 @@ bool PlanCache::UpdatePlanFeedback(const ExecutionPlanCacheKey &key, idx_t actua
 		if (estimated > 0) {
 			double ratio = static_cast<double>(cached.smoothed_actual_rows) / static_cast<double>(estimated);
 			if (ratio > REPLAN_OVERESTIMATE_RATIO || ratio < REPLAN_UNDERESTIMATE_RATIO) {
-				replan_counts_[key] = replan_count + 1;
+				RecordReplan(key, MinValue<idx_t>(replan_count + 1, 9));
 				cache_.erase(it);
+				CompactEvictionQueue();
 				generation_++;
 				return true;
 			}
@@ -243,6 +250,7 @@ void PlanCache::Clear() {
 	cache_.clear();
 	eviction_queue_.clear();
 	replan_counts_.clear();
+	replan_lru_.clear();
 	generation_++;
 }
 
@@ -257,11 +265,13 @@ void PlanCache::InvalidateTable(const string &schema, const string &table) {
 	}
 	for (auto it = replan_counts_.begin(); it != replan_counts_.end();) {
 		if (it->first.schema_name == schema && it->first.table_name == table) {
+			replan_lru_.erase(it->second.position);
 			it = replan_counts_.erase(it);
 		} else {
 			++it;
 		}
 	}
+	CompactEvictionQueue();
 	generation_++;
 }
 
@@ -273,6 +283,44 @@ idx_t PlanCache::GetGeneration() const {
 idx_t PlanCache::Size() const {
 	lock_guard<std::mutex> lock(mutex_);
 	return cache_.size();
+}
+
+std::pair<idx_t, idx_t> PlanCache::AuxiliarySizes() const {
+	lock_guard<std::mutex> lock(mutex_);
+	return {eviction_queue_.size(), replan_counts_.size()};
+}
+
+void PlanCache::ForgetReplanHistory(const ExecutionPlanCacheKey &key) {
+	auto it = replan_counts_.find(key);
+	if (it != replan_counts_.end()) {
+		replan_lru_.erase(it->second.position);
+		replan_counts_.erase(it);
+	}
+}
+
+void PlanCache::PruneReplanHistory() {
+	auto now = clock_();
+	while (!replan_lru_.empty()) {
+		auto it = replan_counts_.find(replan_lru_.front());
+		if (now - it->second.updated < std::chrono::seconds(PLAN_CACHE_TTL_SECONDS)) {
+			break;
+		}
+		ForgetReplanHistory(it->first);
+	}
+}
+
+void PlanCache::RecordReplan(const ExecutionPlanCacheKey &key, idx_t count) {
+	ForgetReplanHistory(key);
+	while (replan_counts_.size() >= MAX_PLAN_CACHE_SIZE) {
+		ForgetReplanHistory(replan_lru_.front());
+	}
+	replan_lru_.push_back(key);
+	try {
+		replan_counts_.emplace(key, ReplanHistory{count, clock_(), std::prev(replan_lru_.end())});
+	} catch (...) {
+		replan_lru_.pop_back();
+		throw;
+	}
 }
 
 void PlanCache::CompactEvictionQueue() {
@@ -295,6 +343,7 @@ void PlanCache::EvictOldest() {
 		eviction_queue_.pop_front();
 		auto it = cache_.find(entry.key);
 		if (it != cache_.end() && it->second.eviction_seq == entry.seq) {
+			ForgetReplanHistory(it->first);
 			cache_.erase(it);
 			return;
 		}

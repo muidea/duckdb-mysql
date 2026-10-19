@@ -20,3 +20,20 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
 target_include_directories(${TARGET_NAME}_loadable_extension
                            PRIVATE include ${MYSQL_INCLUDE_DIR})
 target_link_libraries(${TARGET_NAME}_loadable_extension ${MYSQL_LIBRARIES})
+
+option(MYSQL_BUILD_RESOURCE_TESTS "构建无数据库缓存生命周期测试" OFF)
+if(MYSQL_BUILD_RESOURCE_TESTS)
+  add_executable(mysql_plan_cache_resource_test test/plan_cache_resource_test.cpp
+                 src/storage/federation/plan_cache.cpp)
+  target_include_directories(mysql_plan_cache_resource_test PRIVATE src/include)
+  target_link_libraries(mysql_plan_cache_resource_test duckdb)
+  add_executable(mysql_statistics_cache_resource_test
+                 test/statistics_cache_resource_test.cpp ${ALL_OBJECT_FILES})
+  target_include_directories(mysql_statistics_cache_resource_test
+                             PRIVATE src/include ${MYSQL_INCLUDE_DIR})
+  target_link_libraries(mysql_statistics_cache_resource_test
+                        duckdb duckdb_yyjson ${MYSQL_LIBRARIES})
+  enable_testing()
+  add_test(NAME mysql_plan_cache_resources COMMAND mysql_plan_cache_resource_test)
+  add_test(NAME mysql_statistics_cache_resources COMMAND mysql_statistics_cache_resource_test)
+endif()

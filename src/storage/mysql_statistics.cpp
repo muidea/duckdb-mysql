@@ -417,6 +417,7 @@ bool MySQLStatsCache::GetTableStats(const string &schema, const string &table, M
 	auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 	if (seconds >= TABLE_STATS_TTL_SECONDS) {
 		table_stats_.erase(it);
+		CompactEvictionQueue();
 		return false;
 	}
 	out = it->second.stats;
@@ -460,6 +461,7 @@ void MySQLStatsCache::StoreTableStats(const string &schema, const string &table,
 			entry.key = cache_key;
 			entry.seq = seq;
 			eviction_queue_.push_back(std::move(entry));
+			CompactEvictionQueue();
 		}
 	}
 	if (replaced_existing && invalidation_callback_) {
@@ -548,6 +550,12 @@ void MySQLStatsCache::Invalidate(const string &schema, const string &table) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto cache_key = MakeCacheKey(schema, table);
 	table_stats_.erase(cache_key);
+	CompactEvictionQueue();
+}
+
+idx_t MySQLStatsCache::AuxiliaryQueueSize() const {
+	std::lock_guard<std::mutex> lock(mutex_);
+	return eviction_queue_.size();
 }
 
 MySQLStatisticsCollector::MySQLStatisticsCollector(MySQLConnection &connection, MySQLStatsCache &shared_cache)
@@ -1096,16 +1104,6 @@ void MySQLStatisticsCollector::FetchHistograms(const string &schema, const strin
 			yyjson_val *type_val = yyjson_obj_get(root, "histogram-type");
 			if (type_val && yyjson_is_str(type_val)) {
 				hist.histogram_type = yyjson_get_str(type_val);
-			}
-
-			yyjson_val *num_buckets_val = yyjson_obj_get(root, "number-of-buckets-specified");
-			if (num_buckets_val) {
-				hist.num_buckets = static_cast<idx_t>(yyjson_get_uint(num_buckets_val));
-			}
-
-			yyjson_val *sampling_val = yyjson_obj_get(root, "sampling-rate");
-			if (sampling_val) {
-				hist.sampling_rate = yyjson_get_num(sampling_val);
 			}
 
 			yyjson_val *null_val = yyjson_obj_get(root, "null-values");

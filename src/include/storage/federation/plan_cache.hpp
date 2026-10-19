@@ -14,6 +14,9 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <functional>
+#include <iterator>
+#include <list>
 #include <mutex>
 #include <unordered_map>
 
@@ -100,7 +103,11 @@ public:
 	static constexpr double REPLAN_OVERESTIMATE_RATIO = 2.0;
 	static constexpr double REPLAN_UNDERESTIMATE_RATIO = 0.3;
 
-	PlanCache() = default;
+	using Clock = std::function<std::chrono::steady_clock::time_point()>;
+	explicit PlanCache(Clock clock = [] { return std::chrono::steady_clock::now(); }) : clock_(std::move(clock)) {
+	}
+
+	std::pair<idx_t, idx_t> AuxiliarySizes() const;
 
 	bool GetCachedPlan(const ExecutionPlanCacheKey &key, CachedExecutionPlan &out);
 
@@ -120,11 +127,21 @@ public:
 private:
 	mutable std::mutex mutex_;
 	std::unordered_map<ExecutionPlanCacheKey, CachedExecutionPlan, ExecutionPlanCacheKeyHash> cache_;
-	std::unordered_map<ExecutionPlanCacheKey, idx_t, ExecutionPlanCacheKeyHash> replan_counts_;
+	struct ReplanHistory {
+		idx_t count;
+		std::chrono::steady_clock::time_point updated;
+		std::list<ExecutionPlanCacheKey>::iterator position;
+	};
+	std::unordered_map<ExecutionPlanCacheKey, ReplanHistory, ExecutionPlanCacheKeyHash> replan_counts_;
+	std::list<ExecutionPlanCacheKey> replan_lru_;
+	Clock clock_;
 	std::deque<EvictionEntry> eviction_queue_;
 	idx_t generation_ = 0;
 	idx_t next_eviction_seq_ = 0;
 
+	void PruneReplanHistory();
+	void ForgetReplanHistory(const ExecutionPlanCacheKey &key);
+	void RecordReplan(const ExecutionPlanCacheKey &key, idx_t count);
 	void CompactEvictionQueue();
 	void EvictOldest();
 };
