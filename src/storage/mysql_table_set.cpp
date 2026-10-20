@@ -160,7 +160,7 @@ ORDER BY table_name, ordinal_position;
 
 string GetTableInfoQuery(const string &schema_name, const string &table_name) {
 	return StringUtil::Replace(StringUtil::Replace(R"(
-SELECT column_name, data_type, column_type, column_default, is_nullable, numeric_precision, numeric_scale
+SELECT column_name, data_type, column_type, column_default, is_nullable, numeric_precision, numeric_scale, table_name
 FROM information_schema.columns
 WHERE table_schema=${SCHEMA_NAME} AND table_name=${TABLE_NAME}
 ORDER BY table_name, ordinal_position;
@@ -182,7 +182,16 @@ unique_ptr<MySQLTableInfo> MySQLTableSet::GetTableInfo(ClientContext &context, M
 	auto query = GetTableInfoQuery(schema.name, table_name);
 	auto result = transaction.Query(query);
 	auto table_info = make_uniq<MySQLTableInfo>(schema, table_name);
+	string selected_name;
 	while (result->Next()) {
+		auto remote_name = result->GetString(7);
+		if (selected_name.empty() || (remote_name == table_name && selected_name != table_name)) {
+			selected_name = remote_name;
+			table_info = make_uniq<MySQLTableInfo>(schema, selected_name);
+		}
+		if (remote_name != selected_name) {
+			continue;
+		}
 		AddColumn(context, *result, *table_info, 0);
 	}
 	return table_info;
@@ -190,10 +199,11 @@ unique_ptr<MySQLTableInfo> MySQLTableSet::GetTableInfo(ClientContext &context, M
 
 optional_ptr<CatalogEntry> MySQLTableSet::RefreshTable(ClientContext &context, const string &table_name) {
 	auto table_info = GetTableInfo(context, schema, table_name);
+	if (!table_info || table_info->create_info->columns.LogicalColumnCount() == 0) {
+		return nullptr;
+	}
 	auto table_entry = make_uniq<MySQLTableEntry>(catalog, schema, *table_info);
-	auto table_ptr = table_entry.get();
-	CreateEntry(std::move(table_entry));
-	return table_ptr;
+	return CreateEntry(std::move(table_entry));
 }
 
 // FIXME - this is almost entirely copied from TableCatalogEntry::ColumnsToSQL -

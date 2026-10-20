@@ -10,6 +10,10 @@ MySQLCatalogSet::MySQLCatalogSet(Catalog &catalog) : catalog(catalog), is_loaded
 
 optional_ptr<CatalogEntry> MySQLCatalogSet::GetEntry(ClientContext &context, const string &name) {
 	TryLoadEntries(context);
+	return GetEntryIfLoaded(name);
+}
+
+optional_ptr<CatalogEntry> MySQLCatalogSet::GetEntryIfLoaded(const string &name) {
 	lock_guard<mutex> l(entry_lock);
 	auto entry = entries.find(name);
 	if (entry == entries.end()) {
@@ -24,7 +28,12 @@ void MySQLCatalogSet::TryLoadEntries(ClientContext &context) {
 		return;
 	}
 	is_loaded = true;
-	LoadEntries(context);
+	try {
+		LoadEntries(context);
+	} catch (...) {
+		is_loaded = false;
+		throw;
+	}
 }
 
 void MySQLCatalogSet::DropEntry(ClientContext &context, DropInfo &info) {
@@ -65,8 +74,8 @@ optional_ptr<CatalogEntry> MySQLCatalogSet::CreateEntry(unique_ptr<CatalogEntry>
 	if (result->name.empty()) {
 		throw InternalException("MySQLCatalogSet::CreateEntry called with empty name");
 	}
-	entries.insert(make_pair(result->name, std::move(entry)));
-	return result;
+	auto inserted = entries.insert(make_pair(result->name, std::move(entry)));
+	return inserted.first->second.get();
 }
 
 void MySQLCatalogSet::ClearEntries() {

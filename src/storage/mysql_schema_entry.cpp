@@ -204,7 +204,15 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::LookupEntry(CatalogTransaction tran
 	if (!CatalogTypeIsSupported(lookup_type)) {
 		return nullptr;
 	}
-	return GetCatalogSet(lookup_type).GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
+	auto &set = GetCatalogSet(lookup_type);
+	if (lookup_type == CatalogType::TABLE_ENTRY || lookup_type == CatalogType::VIEW_ENTRY) {
+		auto entry = set.GetEntryIfLoaded(lookup_info.GetEntryName());
+		if (entry) {
+			return entry;
+		}
+		return tables.RefreshTable(transaction.GetContext(), lookup_info.GetEntryName());
+	}
+	return set.GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
 }
 
 MySQLCatalogSet &MySQLSchemaEntry::GetCatalogSet(CatalogType type) {
