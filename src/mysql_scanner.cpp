@@ -45,6 +45,9 @@ struct MySQLGlobalState : public GlobalTableFunctionState {
 	explicit MySQLGlobalState(unique_ptr<MySQLResultReader> result_p) : result(std::move(result_p)) {
 	}
 
+	// Execution owns the lease. Cached bound plans must never reserve source
+	// connections. Destroy the result/statement before returning its connection.
+	MySQLPooledConnection pooled_connection;
 	unique_ptr<MySQLResultReader> result;
 	unique_ptr<ExpressionExecutor> local_filter_executor;
 	unique_ptr<Expression> owned_filter_expression;
@@ -713,7 +716,7 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 			names.push_back(field.name);
 			return_types.push_back(field.duckdb_type);
 		}
-		return make_uniq<MySQLQueryBindData>(std::move(sql), catalog, std::move(conn), true);
+		return make_uniq<MySQLQueryBindData>(std::move(sql), catalog, vector<Value>(), return_types, names, true);
 	}
 
 	bool streaming_enabled = true;
@@ -723,17 +726,6 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 		if (!bool_val.IsNull()) {
 			streaming_enabled = BooleanValue::Get(bool_val);
 		}
-	}
-
-	if (!streaming_enabled) {
-		auto &transaction = MySQLTransaction::Get(context, catalog);
-		MySQLConnection &conn = transaction.GetConnection();
-		auto result = conn.Query(sql, params, MySQLResultStreaming::FORCE_MATERIALIZATION);
-		for (auto &field : result->Fields()) {
-			names.push_back(field.name);
-			return_types.push_back(field.duckdb_type);
-		}
-		return make_uniq<MySQLQueryBindData>(std::move(sql), catalog, std::move(result));
 	}
 
 	auto acquire_mode = MySQLConnectionPool::GetAcquireMode(context);
@@ -751,34 +743,56 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 		names.push_back(field.name);
 		return_types.push_back(field.duckdb_type);
 	}
-	return make_uniq<MySQLQueryBindData>(std::move(sql), catalog, std::move(conn), std::move(stmt), std::move(params));
+	return make_uniq<MySQLQueryBindData>(std::move(sql), catalog, std::move(params), return_types, names, false,
+	                                    !streaming_enabled);
 }
 
 static unique_ptr<GlobalTableFunctionState> MySQLQueryInitGlobalState(ClientContext &context,
                                                                       TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->CastNoConst<MySQLQueryBindData>();
-	unique_ptr<MySQLResultReader> mysql_result;
-	if (bind_data.result) {
-		mysql_result = std::move(bind_data.result);
+	auto &bind_data = input.bind_data->Cast<MySQLQueryBindData>();
+	auto state = make_uniq<MySQLGlobalState>(nullptr);
+	auto &catalog = bind_data.catalog.Cast<MySQLCatalog>();
+	auto check_fields = [&](const vector<MySQLField> &fields) {
+		if (fields.size() != bind_data.types.size()) {
+			throw BinderException("MySQL query result schema changed; prepare again");
+		}
+		for (idx_t i = 0; i < fields.size(); i++) {
+			if (fields[i].duckdb_type != bind_data.types[i] || fields[i].name != bind_data.names[i]) {
+				throw BinderException("MySQL query result schema changed; prepare again");
+			}
+		}
+	};
+	if (bind_data.materialized) {
+		// Preserve the nonstreaming path's participation in the DuckDB source
+		// transaction, but never execute or retain a result in a cached binding.
+		auto &connection = MySQLTransaction::Get(context, catalog).GetConnection();
+		auto statement = connection.Prepare(bind_data.query);
+		check_fields(statement->Fields());
+		state->result = connection.Query(*statement, bind_data.params, MySQLResultStreaming::FORCE_MATERIALIZATION);
+		check_fields(state->result->Fields());
+		return std::move(state);
 	}
-	return unique_ptr<GlobalTableFunctionState>(new MySQLGlobalState(std::move(mysql_result)));
+	string time_zone;
+	Value setting;
+	if (context.TryGetCurrentSetting("mysql_session_time_zone", setting)) {
+		time_zone = setting.ToString();
+	}
+	state->pooled_connection = catalog.GetConnectionPool().Acquire(MySQLConnectionPool::GetAcquireMode(context), time_zone);
+	auto &connection = state->pooled_connection.GetConnection();
+	connection.SetTypeConfig(MySQLTypeConfig(context));
+	if (bind_data.use_text_protocol) {
+		state->result = connection.QueryText(bind_data.query);
+		check_fields(state->result->Fields());
+	} else {
+		auto statement = connection.Prepare(bind_data.query);
+		check_fields(statement->Fields());
+		state->result = connection.Query(*statement, bind_data.params, MySQLResultStreaming::ALLOW_STREAMING);
+		check_fields(state->result->Fields());
+	}
+	return std::move(state);
 }
 
 static void MySQLQueryScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &gstate = data.global_state->Cast<MySQLGlobalState>();
-	if (!gstate.result) {
-		auto &bind_data = data.bind_data->CastNoConst<MySQLQueryBindData>();
-		D_ASSERT(bind_data.pooled_connection);
-		if (bind_data.use_text_protocol) {
-			gstate.result = bind_data.pooled_connection.GetConnection().QueryText(bind_data.query);
-			MySQLScan(context, data, output);
-			return;
-		}
-		D_ASSERT(bind_data.stmt);
-		auto result = bind_data.pooled_connection->Query(*bind_data.stmt, bind_data.params,
-		                                                 MySQLResultStreaming::ALLOW_STREAMING);
-		gstate.result = std::move(result);
-	}
 	MySQLScan(context, data, output);
 }
 

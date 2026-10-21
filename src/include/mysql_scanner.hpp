@@ -48,29 +48,21 @@ public:
 };
 
 struct MySQLQueryBindData : public FunctionData {
-	MySQLQueryBindData(string query_p, Catalog &catalog, MySQLPooledConnection pooled_connection_p,
-	                   unique_ptr<MySQLStatement> stmt_p, vector<Value> params_p)
-	    : query(std::move(query_p)), catalog(catalog), pooled_connection(std::move(pooled_connection_p)),
-	      stmt(std::move(stmt_p)), params(std::move(params_p)) {
-	}
-
-	MySQLQueryBindData(string query_p, Catalog &catalog, unique_ptr<MySQLResult> result_p)
-	    : query(std::move(query_p)), catalog(catalog), pooled_connection(), result(std::move(result_p)) {
-	}
-
-	MySQLQueryBindData(string query_p, Catalog &catalog, MySQLPooledConnection pooled_connection_p,
-	                   bool use_text_protocol_p)
-	    : query(std::move(query_p)), catalog(catalog), pooled_connection(std::move(pooled_connection_p)),
-	      use_text_protocol(use_text_protocol_p) {
+	MySQLQueryBindData(string query_p, Catalog &catalog, vector<Value> params_p,
+	                   vector<LogicalType> types_p, vector<string> names_p, bool text_protocol = false,
+	                   bool materialize = false)
+	    : query(std::move(query_p)), catalog(catalog), params(std::move(params_p)),
+	      types(std::move(types_p)), names(std::move(names_p)), use_text_protocol(text_protocol),
+	      materialized(materialize) {
 	}
 
 	string query;
 	Catalog &catalog;
-	MySQLPooledConnection pooled_connection;
-	unique_ptr<MySQLResultReader> result;
-	unique_ptr<MySQLStatement> stmt;
 	vector<Value> params;
+	vector<LogicalType> types;
+	vector<string> names;
 	bool use_text_protocol = false;
+	bool materialized = false;
 
 public:
 	unique_ptr<FunctionData> Copy() const override {

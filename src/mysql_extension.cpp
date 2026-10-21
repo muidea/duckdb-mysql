@@ -177,7 +177,12 @@ void SetMySQLSecretParameters(CreateSecretFunction &function) {
 	function.named_parameters["ssl_key"] = LogicalType::VARCHAR;
 }
 
+namespace duckdb { void RegisterMySQLGuardedCRUD(ExtensionLoader &loader); }
+
 static void LoadInternal(ExtensionLoader &loader) {
+#ifdef MYSQL_GUARDED_CRUD
+    RegisterMySQLGuardedCRUD(loader);
+#endif
 	mysql_library_init(0, NULL, NULL);
 	MySQLClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);

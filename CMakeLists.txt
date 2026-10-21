@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.5.0)
 set(TARGET_NAME mysql_scanner)
 project(${TARGET_NAME})
+option(MYSQL_GUARDED_CRUD "Build explicit guarded CRUD runtime" OFF)
 
 set(libmariadb_DIR ${CMAKE_CURRENT_LIST_DIR}/vcpkg_ports/libmariadb)
 find_package(libmariadb REQUIRED)

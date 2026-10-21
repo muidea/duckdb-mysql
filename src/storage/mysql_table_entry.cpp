@@ -5,6 +5,7 @@
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 #include "mysql_scanner.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 
 namespace duckdb {
 
@@ -81,8 +82,11 @@ unique_ptr<BaseStatistics> MySQLTableEntry::GetStatistics(ClientContext &context
 	return nullptr;
 }
 
-void MySQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &,
+void MySQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &update,
                                             ClientContext &) {
+	// DuckDB 1.5.3 leaves this flag to the table implementation. MySQL performs
+	// one native UPDATE; an uninitialized flag makes repeated binding random.
+	update.update_is_del_and_insert = false;
 }
 
 TableFunction MySQLTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {

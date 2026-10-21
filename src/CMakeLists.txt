@@ -16,6 +16,10 @@ add_library(
   mysql_storage.cpp
   mysql_types.cpp
   mysql_utils.cpp)
+if(MYSQL_GUARDED_CRUD)
+  target_sources(mysql_ext_library PRIVATE mysql_guarded_crud.cpp)
+  target_compile_definitions(mysql_ext_library PRIVATE MYSQL_GUARDED_CRUD=1)
+endif()
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:mysql_ext_library>
     PARENT_SCOPE)
