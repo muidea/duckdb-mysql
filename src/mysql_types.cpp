@@ -111,9 +111,8 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 	           type_info.type_name == "multipolygon" || type_info.type_name == "geomcollection") {
 		return LogicalType::BLOB;
 	} else if (type_info.type_name == "varchar" || type_info.type_name == "string" ||
-	           type_info.type_name == "mediumtext" ||
-	           type_info.type_name == "longtext" || type_info.type_name == "text" || type_info.type_name == "enum" ||
-	           type_info.type_name == "char") {
+	           type_info.type_name == "mediumtext" || type_info.type_name == "longtext" ||
+	           type_info.type_name == "text" || type_info.type_name == "enum" || type_info.type_name == "char") {
 		return LogicalType::VARCHAR;
 	} else if (type_info.type_name == "array" || type_info.type_name == "map" || type_info.type_name == "struct") {
 		return LogicalType::VARCHAR;
@@ -186,9 +185,15 @@ LogicalType MySQLTypes::FieldToLogicalType(const MySQLTypeConfig &type_config, M
 		type_data.type_name = "enum";
 		break;
 	case MYSQL_TYPE_BLOB:
+	case MYSQL_TYPE_TINY_BLOB:
+	case MYSQL_TYPE_MEDIUM_BLOB:
+	case MYSQL_TYPE_LONG_BLOB:
 	case MYSQL_TYPE_STRING:
 	case MYSQL_TYPE_VAR_STRING:
-		if (field->flags & BINARY_FLAG) {
+	case MYSQL_TYPE_VARCHAR:
+		// BINARY_FLAG also marks text with a *_bin collation. Only the
+		// protocol's binary charset (63) identifies an actual binary value.
+		if (field->charsetnr == 63) {
 			type_data.type_name = "blob";
 		} else {
 			type_data.type_name = "varchar";
