@@ -7,7 +7,16 @@
 
 namespace duckdb {
 namespace {
-static void Reject() { throw InvalidInputException("guarded MySQL operation rejected"); }
+// Fixed diagnostics only; never return SQL, credentials or vendor messages.
+struct GuardRejection : public std::exception {
+    const char *state;
+    const char *stage;
+    GuardRejection(const char *state_p, const char *stage_p) : state(state_p), stage(stage_p) {}
+    const char *what() const noexcept override { return "guarded MySQL operation rejected"; }
+};
+static void Reject(const char *state = "0A000", const char *stage = "capability_dialect") {
+    throw GuardRejection {state, stage};
+}
 static string Quote(const string &s) {
     string out = "\"";
     for (auto c : s) {
@@ -63,13 +72,14 @@ static void CheckVisibility(MySQLConnection &c,const string &schema) {
         visible=visible || permissions.find(",ALL PRIVILEGES,")!=string::npos ||
             permissions.find(",TRIGGER,")!=string::npos || permissions.find(", TRIGGER,")!=string::npos;
     }
-    if (!visible) Reject(); // Missing TRIGGER visibility must never certify an empty trigger list.
+    if (!visible) Reject("42501", "capability_permission"); // Missing TRIGGER visibility must never certify an empty trigger list.
 }
-static string Metadata(MySQLConnection &c,const Data &d) {
+static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
     vector<Value> args={Value(d.schema),Value(d.table)};
     auto table=Query(c,"SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",args);
     if (!table->Next() || table->GetString(0)!="BASE TABLE" || table->GetString(1)!="InnoDB" || table->Next()) Reject();
-    auto id=Scalar(c,"SELECT CAST(TABLE_ID AS CHAR) FROM information_schema.INNODB_TABLES WHERE NAME=CONCAT(?,'/',?)",args);
+    auto id=Scalar(c, string("SELECT CAST(TABLE_ID AS CHAR) FROM information_schema.") +
+        (modern_innodb ? "INNODB_TABLES" : "INNODB_SYS_TABLES") + " WHERE NAME=CONCAT(?,'/',?)",args);
     auto features=Scalar(c,"SELECT CAST((SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? AND EVENT_OBJECT_TABLE=?) + (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_TYPE NOT IN ('PRIMARY KEY','UNIQUE')) + (SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND PARTITION_NAME IS NOT NULL) AS CHAR)",
         {Value(d.schema),Value(d.table),Value(d.schema),Value(d.table),Value(d.schema),Value(d.table)});
     if (features!="0") Reject();
@@ -88,7 +98,10 @@ static string Metadata(MySQLConnection &c,const Data &d) {
 }
 static string ErrorState(unsigned int code) {
     switch(code) {case 1062:return "23505"; case 1048:case 1364:return "23502"; case 1264:return "22003";
-    case 1406:return "22001"; case 1213:return "40P01"; case 1205:return "55P03"; case 1142:case 1143:return "42501"; default:return "HY000";}
+    case 1406:return "22001"; case 1213:return "40P01"; case 1205:return "55P03"; case 1142:case 1143:case 1227:case 1044:case 1045:return "42501";
+    case 1146:return "42P01"; case 1054:return "42703";
+    case 2002:case 2003:case 2006:case 2013:case 2055:return "08006";
+    default:return "HY000";}
 }
 static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
     auto &state=in.global_state->Cast<State>(); if (state.done)return; state.done=true;
@@ -98,24 +111,41 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
     unique_ptr<GuardedCRUDDeadline> deadline;
     try {
         if (ctx.IsInterrupted()) throw InterruptException();
-        if (d.catalog.GetBackendCapabilities().kind!=MySQLBackendKind::MYSQL_STANDARD) Reject();
+        if (d.catalog.GetBackendCapabilities().kind!=MySQLBackendKind::MYSQL_STANDARD) Reject("0A000", "capability_adapter");
         pooled=d.catalog.GetConnectionPool().Acquire(dbconnector::pool::AcquireMode::TRY);
         auto &c=pooled.GetConnection();
         deadline = make_uniq<GuardedCRUDDeadline>(ctx, mysql_get_socket(c.GetConn()));
         // Reject dirty pooled sessions; never implicitly commit a query transaction.
-        if (c.GetConn()->server_status & SERVER_STATUS_IN_TRANS) Reject();
+        if (c.GetConn()->server_status & SERVER_STATUS_IN_TRANS) Reject("HY000", "source_session");
+        // Prove source identity before issuing MySQL-specific session controls.
+        // Wire-compatible systems can expose VERSION()=8.x while rejecting SET.
+        // Such a refusal is an adaptation gap, not a transport failure.
+        stage="source_identity";
+        version=Scalar(c,"SELECT VERSION()");
+        if (mysql_get_server_version(c.GetConn()) < 50700) Reject("0A000", "capability_adapter");
+        if (d.execute && version!=d.version) Reject("0A000", "source_descriptor");
+        auto comment = Scalar(c,"SELECT @@version_comment");
+        // Distribution builds may identify their packager instead of using
+        // the word MySQL. Do not admit arbitrary wire-compatible products.
+        bool distribution = ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
+                            ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
+        if (Scalar(c,"SELECT DATABASE()")!=d.schema ||
+            (!distribution && comment.find("MySQL")==string::npos)) Reject("0A000", "capability_adapter");
+        auto modern_innodb = Scalar(c,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='INNODB_TABLES'") == "1";
+        stage="source_session";
         c.Execute("SET SESSION autocommit=1");
         c.Execute("SET SESSION sql_mode='STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,NO_BACKSLASH_ESCAPES'");
-        c.Execute("SET NAMES utf8mb4 COLLATE utf8mb4_0900_bin");
+        // Session encoding is shared; text predicates still require their own
+        // source-column NO PAD contract in the connector. 5.7 has no 0900 collation.
+        auto has_0900 = Scalar(c,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.COLLATIONS WHERE COLLATION_NAME='utf8mb4_0900_bin'") == "1";
+        c.Execute(has_0900 ? "SET NAMES utf8mb4 COLLATE utf8mb4_0900_bin" : "SET NAMES utf8mb4 COLLATE utf8mb4_bin");
         c.Execute("SET SESSION time_zone='+00:00'");
         c.Execute("SET SESSION lock_wait_timeout=5"); c.Execute("SET SESSION innodb_lock_wait_timeout=5");
-        version=Scalar(c,"SELECT VERSION()");
-        if ((version.find("8.0.")!=0 && version.find("8.4.")!=0) || (d.execute && version!=d.version)) Reject();
-        if (Scalar(c,"SELECT DATABASE()")!=d.schema || Scalar(c,"SELECT @@version_comment").find("MySQL")==string::npos) Reject();
         CheckVisibility(c,d.schema);
         c.Execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); c.Execute("START TRANSACTION");
-        auto lock=Query(c,"SELECT * FROM "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table)+" LIMIT 0 FOR SHARE");
-        descriptor=Metadata(c,d);
+        auto lock=Query(c,"SELECT * FROM "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table)+" LIMIT 0 LOCK IN SHARE MODE");
+        stage="source_metadata";
+        descriptor=Metadata(c,d,modern_innodb);
         if (d.execute) {
             stage="source_descriptor";
             if (descriptor!=d.expected) {error="0A000";Reject();}
@@ -136,8 +166,12 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
             stage="source_commit";status="COMMIT_STATUS_UNKNOWN";finished=true;
             c.Execute("COMMIT"); status="COMMITTED";stage.clear();
         } else {c.Execute("ROLLBACK");finished=true;stage.clear();}
+    } catch (const GuardRejection &rejection) {
+        if (error.empty()) error = rejection.state;
+        if (!sent && stage != "source_descriptor" && stage != "source_execute") stage = rejection.stage;
     } catch (...) {
-        if (error.empty()) error=ctx.IsInterrupted()?"57014":"08006";
+        if (error.empty()) error=ctx.IsInterrupted()?"57014":
+            (pooled ? ErrorState(mysql_errno(pooled.GetConnection().GetConn())) : "08006");
     }
     if (pooled) {
         auto &c=pooled.GetConnection();
