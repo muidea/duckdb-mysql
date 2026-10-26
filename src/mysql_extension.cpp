@@ -220,7 +220,10 @@ void SetMySQLSecretParameters(CreateSecretFunction &function) {
 	function.named_parameters["ssl_key"] = LogicalType::VARCHAR;
 }
 
-namespace duckdb { void RegisterMySQLGuardedCRUD(ExtensionLoader &loader); }
+namespace duckdb {
+void RegisterMySQLGuardedCRUD(ExtensionLoader &loader);
+void RegisterMySQLDDLMetadata(ExtensionLoader &loader);
+}
 
 static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction decimal_key("mysql_exact_decimal", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
@@ -230,6 +233,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterCollation(exact_decimal);
 #ifdef MYSQL_GUARDED_CRUD
     RegisterMySQLGuardedCRUD(loader);
+    RegisterMySQLDDLMetadata(loader);
 #endif
 	mysql_library_init(0, NULL, NULL);
 	MySQLClearCacheFunction clear_cache_func;

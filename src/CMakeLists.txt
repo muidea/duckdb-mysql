@@ -17,7 +17,7 @@ add_library(
   mysql_types.cpp
   mysql_utils.cpp)
 if(MYSQL_GUARDED_CRUD)
-  target_sources(mysql_ext_library PRIVATE mysql_guarded_crud.cpp)
+  target_sources(mysql_ext_library PRIVATE mysql_guarded_crud.cpp mysql_ddl_metadata.cpp)
   target_compile_definitions(mysql_ext_library PRIVATE MYSQL_GUARDED_CRUD=1)
 endif()
 set(ALL_OBJECT_FILES
