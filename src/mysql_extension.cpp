@@ -223,6 +223,7 @@ void SetMySQLSecretParameters(CreateSecretFunction &function) {
 namespace duckdb {
 void RegisterMySQLGuardedCRUD(ExtensionLoader &loader);
 void RegisterMySQLDDLMetadata(ExtensionLoader &loader);
+void RegisterMySQLGuardedDDL(ExtensionLoader &loader);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -234,6 +235,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 #ifdef MYSQL_GUARDED_CRUD
     RegisterMySQLGuardedCRUD(loader);
     RegisterMySQLDDLMetadata(loader);
+    RegisterMySQLGuardedDDL(loader);
 #endif
 	mysql_library_init(0, NULL, NULL);
 	MySQLClearCacheFunction clear_cache_func;
