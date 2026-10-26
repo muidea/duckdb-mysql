@@ -122,7 +122,6 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         // Such a refusal is an adaptation gap, not a transport failure.
         stage="source_identity";
         version=Scalar(c,"SELECT VERSION()");
-        if (mysql_get_server_version(c.GetConn()) < 50700) Reject("0A000", "capability_adapter");
         if (d.execute && version!=d.version) Reject("0A000", "source_descriptor");
         auto comment = Scalar(c,"SELECT @@version_comment");
         // Distribution builds may identify their packager instead of using

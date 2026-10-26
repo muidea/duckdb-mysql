@@ -26,6 +26,7 @@ static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const My
 		case LogicalTypeId::FLOAT:
 		case LogicalTypeId::DATE:
 		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::VARCHAR:
 			ltypes.push_back(lt);
 			break;
 		case LogicalTypeId::DOUBLE: {

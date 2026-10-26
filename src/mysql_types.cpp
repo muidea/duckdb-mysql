@@ -85,7 +85,16 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 		if (type_info.precision > 0 && type_info.precision <= 38) {
 			return LogicalType::DECIMAL(type_info.precision, type_info.scale);
 		}
-		return LogicalType::DOUBLE;
+		// DuckDB DECIMAL stops at 38 digits. Preserve the source's decimal
+		// text and typmod rather than rounding through binary64.
+		if (type_info.precision > 38 && type_info.precision <= 65 && type_info.scale >= 0 &&
+		    type_info.scale <= 30 && type_info.scale <= type_info.precision) {
+			auto result = LogicalType::VARCHAR_COLLATION("mysql_exact_decimal");
+			result.SetAlias("MYSQL_DECIMAL(" + std::to_string(type_info.precision) + "," +
+			                std::to_string(type_info.scale) + ")");
+			return result;
+		}
+		throw NotImplementedException("MySQL decimal precision/scale cannot be represented losslessly");
 	} else if (type_info.type_name == "boolean") {
 		return LogicalType::BOOLEAN;
 	} else if (type_info.type_name == "json") {
@@ -147,7 +156,9 @@ LogicalType MySQLTypes::FieldToLogicalType(const MySQLTypeConfig &type_config, M
 		break;
 	case MYSQL_TYPE_DECIMAL:
 	case MYSQL_TYPE_NEWDECIMAL:
-		type_data.precision = int64_t(field->length) - 2; // -2 for minus sign and dot
+		// A sign byte is absent for unsigned DECIMAL; a point is absent at scale 0.
+		type_data.precision = int64_t(field->length) - ((field->flags & UNSIGNED_FLAG) ? 0 : 1) -
+		                      (field->decimals ? 1 : 0);
 		type_data.scale = field->decimals;
 		type_data.type_name = "decimal";
 		break;
