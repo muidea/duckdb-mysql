@@ -8,18 +8,28 @@
 // ONLY/inheritance, implicit column attributes and non-equivalent conversions.
 namespace duckdb {
 struct GuardedDDLIntent {
+	int32_t contract_version = 2;
 	string database, schema, operation, action, name, index, owner, new_name, column_name, sql;
 	vector<string> columns, keys;
-	static bool Name(const string &s) { return !s.empty() && s.size() <= 63 && s.find('\0') == string::npos; }
+	string default_kind, default_value, constraint_name, constraint_kind, check_column, check_operator, check_value,
+	    reference_schema, reference_table, identity_mode;
+	vector<string> constraint_keys, reference_keys;
+	static GuardedDDLIntent BindV4(const vector<Value> &input, bool mysql);
+	static bool Name(const string &s) {
+		return !s.empty() && s.size() <= 63 && s.find('\0') == string::npos;
+	}
 	static string Text(const Value &v) {
 		if (v.IsNull() || v.type().id() != LogicalTypeId::VARCHAR)
 			throw BinderException("DDL structured input is invalid");
 		return v.GetValue<string>();
 	}
 	static GuardedDDLIntent Bind(const vector<Value> &input, bool mysql, int32_t contract = 2) {
+		if (contract == 4)
+			return BindV4(input, mysql);
 		if (input.size() != 5)
 			throw BinderException("DDL structured input is invalid");
 		GuardedDDLIntent d;
+		d.contract_version = contract;
 		d.database = Text(input[1]);
 		d.schema = Text(input[2]);
 		d.operation = Text(input[3]);
@@ -28,7 +38,7 @@ struct GuardedDDLIntent {
 		for (idx_t i = 0; i < d.operation.size(); i++) {
 			auto c = d.operation[i];
 			if ((i == 8 || i == 13 || i == 18 || i == 23) ? c != '-'
-														  : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+			                                              : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
 				throw BinderException("DDL operation identity is invalid");
 		}
 		if (mysql && d.database != d.schema)
@@ -51,7 +61,7 @@ struct GuardedDDLIntent {
 			if (types[i].first != names[i] || fields[i].IsNull())
 				throw BinderException("DDL fields are invalid");
 		if (fields[0].type().id() != LogicalTypeId::INTEGER || fields[0].GetValue<int32_t>() != contract ||
-			Text(fields[1]) != "EXECUTION_NAME")
+		    Text(fields[1]) != "EXECUTION_NAME")
 			throw BinderException("DDL contract is unavailable");
 		d.action = Text(fields[2]);
 		d.name = Text(fields[3]);
@@ -66,16 +76,20 @@ struct GuardedDDLIntent {
 			if ((!d.new_name.empty() && !Name(d.new_name)) || (!d.column_name.empty() && !Name(d.column_name)))
 				throw BinderException("DDL altered name is invalid");
 		}
-		const bool extended_action = d.action == "rename_table" || d.action == "add_column" || d.action == "rename_column" || d.action == "rename_index";
+		const bool extended_action = d.action == "rename_table" || d.action == "add_column" ||
+		                             d.action == "rename_column" || d.action == "rename_index";
 		if (extended_action != (contract == 3))
 			throw BinderException("DDL action requires a different contract");
-		if (fields[6 + offset].type().id() != LogicalTypeId::LIST || fields[7 + offset].type().id() != LogicalTypeId::LIST)
+		if (fields[6 + offset].type().id() != LogicalTypeId::LIST ||
+		    fields[7 + offset].type().id() != LogicalTypeId::LIST)
 			throw BinderException("DDL payload is invalid");
 		const auto &cols = ListValue::GetChildren(fields[6 + offset]);
 		const auto &keys = ListValue::GetChildren(fields[7 + offset]);
 		if (cols.size() > 256 || keys.size() > 32)
 			throw BinderException("DDL payload bound exceeded");
-		auto quote = [&](const string &s) { return KeywordHelper::WriteQuoted(s, mysql ? '`' : '"'); };
+		auto quote = [&](const string &s) {
+			return KeywordHelper::WriteQuoted(s, mysql ? '`' : '"');
+		};
 		vector<string> seen;
 		for (auto &col : cols) {
 			if (col.IsNull() || col.type().id() != LogicalTypeId::STRUCT)
@@ -83,7 +97,7 @@ struct GuardedDDLIntent {
 			const auto &ct = StructType::GetChildTypes(col.type());
 			const auto &cv = StructValue::GetChildren(col);
 			if (ct.size() != 3 || ct[0].first != "name" || ct[1].first != "type" || ct[2].first != "length" ||
-				cv[2].IsNull() || cv[2].type().id() != LogicalTypeId::INTEGER)
+			    cv[2].IsNull() || cv[2].type().id() != LogicalTypeId::INTEGER)
 				throw BinderException("DDL column fields are invalid");
 			string n = Text(cv[0]), type = Text(cv[1]);
 			if (!Name(n) || std::find(seen.begin(), seen.end(), n) != seen.end())
@@ -128,32 +142,38 @@ struct GuardedDDLIntent {
 			for (auto &key : d.keys)
 				keySQL.push_back(quote(key));
 			d.sql = string(d.action == "create_unique_index" ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") +
-					quote(d.index) + (mysql ? " USING BTREE ON " : " ON ") + target +
-					(mysql ? " (" : " USING btree (") + StringUtil::Join(keySQL, ",") + ")";
+			        quote(d.index) + (mysql ? " USING BTREE ON " : " ON ") + target +
+			        (mysql ? " (" : " USING btree (") + StringUtil::Join(keySQL, ",") + ")";
 		} else if (d.action == "drop_index") {
 			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() ||
-				(mysql ? d.owner.empty() : !d.owner.empty()))
+			    (mysql ? d.owner.empty() : !d.owner.empty()))
 				throw BinderException("DDL drop index options are invalid");
 			d.sql = "DROP INDEX " +
-					(mysql ? quote(d.name) + " ON " + quote(d.schema) + "." + quote(d.owner) : target + " RESTRICT");
+			        (mysql ? quote(d.name) + " ON " + quote(d.schema) + "." + quote(d.owner) : target + " RESTRICT");
 		} else if (d.action == "rename_table") {
-			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || !d.column_name.empty() || d.new_name.empty() || d.new_name == d.name)
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() ||
+			    !d.column_name.empty() || d.new_name.empty() || d.new_name == d.name)
 				throw BinderException("DDL rename table options are invalid");
 			d.sql = mysql ? "RENAME TABLE " + target + " TO " + quote(d.schema) + "." + quote(d.new_name)
 			              : "ALTER TABLE " + target + " RENAME TO " + quote(d.new_name);
 		} else if (d.action == "add_column") {
-			if (d.columns.size() != 1 || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || !d.column_name.empty() || !d.new_name.empty())
+			if (d.columns.size() != 1 || !d.keys.empty() || !d.index.empty() || !d.owner.empty() ||
+			    !d.column_name.empty() || !d.new_name.empty())
 				throw BinderException("DDL add column options are invalid");
 			// ONLY prevents implicit propagation into PG inheritance children.
 			d.sql = "ALTER TABLE " + string(mysql ? "" : "ONLY ") + target + " ADD COLUMN " + d.columns[0];
 		} else if (d.action == "rename_column") {
-			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || d.column_name.empty() || d.new_name.empty() || d.new_name == d.column_name)
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() ||
+			    d.column_name.empty() || d.new_name.empty() || d.new_name == d.column_name)
 				throw BinderException("DDL rename column options are invalid");
-			d.sql = "ALTER TABLE " + string(mysql ? "" : "ONLY ") + target + " RENAME COLUMN " + quote(d.column_name) + " TO " + quote(d.new_name);
+			d.sql = "ALTER TABLE " + string(mysql ? "" : "ONLY ") + target + " RENAME COLUMN " + quote(d.column_name) +
+			        " TO " + quote(d.new_name);
 		} else if (d.action == "rename_index") {
-			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.column_name.empty() || d.new_name.empty() || d.new_name == d.name || (mysql ? d.owner.empty() : !d.owner.empty()))
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.column_name.empty() ||
+			    d.new_name.empty() || d.new_name == d.name || (mysql ? d.owner.empty() : !d.owner.empty()))
 				throw BinderException("DDL rename index options are invalid");
-			d.sql = mysql ? "ALTER TABLE " + quote(d.schema) + "." + quote(d.owner) + " RENAME INDEX " + quote(d.name) + " TO " + quote(d.new_name)
+			d.sql = mysql ? "ALTER TABLE " + quote(d.schema) + "." + quote(d.owner) + " RENAME INDEX " + quote(d.name) +
+			                    " TO " + quote(d.new_name)
 			              : "ALTER INDEX " + target + " RENAME TO " + quote(d.new_name);
 		} else {
 			throw BinderException("DDL action is unsupported");
@@ -164,3 +184,5 @@ struct GuardedDDLIntent {
 	}
 };
 } // namespace duckdb
+
+#include "guarded_ddl_v4.hpp"
