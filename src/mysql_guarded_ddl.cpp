@@ -18,9 +18,9 @@ struct State : GlobalTableFunctionState {
 static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) {
 	return make_uniq<State>();
 }
-static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-									 vector<string> &names) {
-	auto intent = GuardedDDLIntent::Bind(in.inputs, true);
+static unique_ptr<FunctionData> BindContract(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
+									 vector<string> &names, int32_t contract) {
+	auto intent = GuardedDDLIntent::Bind(in.inputs, true, contract);
 	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, GuardedDDLIntent::Text(in.inputs[0]));
 	if (!db || db->GetCatalog().GetCatalogType() != "mysql")
 		throw BinderException("DDL catalog is unavailable");
@@ -28,6 +28,12 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 			 LogicalType::BIGINT};
 	return make_uniq<Data>(db->GetCatalog().Cast<MySQLCatalog>(), std::move(intent));
+}
+static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types, vector<string> &names) {
+	return BindContract(ctx, in, types, names, 2);
+}
+static unique_ptr<FunctionData> BindV3(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types, vector<string> &names) {
+	return BindContract(ctx, in, types, names, 3);
 }
 static string Scalar(MYSQL *raw, const string &sql) {
 	if (mysql_real_query(raw, sql.c_str(), sql.size()))
@@ -76,6 +82,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			error = "0A000";
 			throw IOException("DDL source not certified");
 		}
+		if (d.intent.action == "rename_column" && version.find("8.0.") != 0) {
+			error = "0A000";
+			throw IOException("DDL column rename has no equivalent native syntax");
+		}
 		if (Scalar(raw, "SELECT CAST(@@read_only AS CHAR)") != "0" ||
 			Scalar(raw, version.find("5.7.") == 0 ? "SELECT CAST(@@session.tx_read_only AS CHAR)"
 												  : "SELECT CAST(@@session.transaction_read_only AS CHAR)") != "0") {
@@ -89,6 +99,21 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			throw IOException("DDL session settings failed");
 		if (ctx.IsInterrupted())
 			throw InterruptException();
+		if (d.intent.action == "rename_table" || d.intent.action == "add_column" || d.intent.action == "rename_column" || d.intent.action == "rename_index") {
+			auto literal = [&](const string &v) {
+				string escaped(v.size() * 2 + 1, '\0');
+				escaped.resize(mysql_real_escape_string(raw, &escaped[0], v.c_str(), v.size()));
+				return "'" + escaped + "'";
+			};
+			const string table = d.intent.action == "rename_index" ? d.intent.owner : d.intent.name;
+			if (Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE TABLE_SCHEMA=" + literal(d.intent.schema) +
+				" AND TABLE_NAME=" + literal(table) + " AND TABLE_TYPE='BASE TABLE' AND ENGINE='InnoDB'") != "1" ||
+			    Scalar(raw, "SELECT count(*) FROM information_schema.partitions WHERE TABLE_SCHEMA=" + literal(d.intent.schema) +
+				" AND TABLE_NAME=" + literal(table) + " AND PARTITION_NAME IS NOT NULL") != "0") {
+				error = "0A000";
+				throw IOException("DDL ordinary InnoDB table scope is unavailable");
+			}
+		}
 		stage = "source_execute";
 		sent = true;
 		if (mysql_real_query(raw, d.intent.sql.c_str(), d.intent.sql.size())) {
@@ -143,5 +168,9 @@ void RegisterMySQLGuardedDDL(ExtensionLoader &loader) {
 		"mysql_guarded_ddl_v2",
 		{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
 		Scan, Bind, Init));
+	loader.RegisterFunction(TableFunction(
+		"mysql_guarded_ddl_v3",
+		{LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+		Scan, BindV3, Init));
 }
 } // namespace duckdb

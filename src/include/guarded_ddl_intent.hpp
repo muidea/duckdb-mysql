@@ -2,13 +2,13 @@
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 
-// Typed v2 execution contract. No input contains native SQL. The source DDL is
+// Typed v2/v3 execution contracts. No input contains native SQL. The source DDL is
 // generated independently in each scanner after validating every represented
 // field. This initial native surface intentionally excludes conditional DDL,
 // ONLY/inheritance, implicit column attributes and non-equivalent conversions.
 namespace duckdb {
 struct GuardedDDLIntent {
-	string database, schema, operation, action, name, index, owner, sql;
+	string database, schema, operation, action, name, index, owner, new_name, column_name, sql;
 	vector<string> columns, keys;
 	static bool Name(const string &s) { return !s.empty() && s.size() <= 63 && s.find('\0') == string::npos; }
 	static string Text(const Value &v) {
@@ -16,7 +16,7 @@ struct GuardedDDLIntent {
 			throw BinderException("DDL structured input is invalid");
 		return v.GetValue<string>();
 	}
-	static GuardedDDLIntent Bind(const vector<Value> &input, bool mysql) {
+	static GuardedDDLIntent Bind(const vector<Value> &input, bool mysql, int32_t contract = 2) {
 		if (input.size() != 5)
 			throw BinderException("DDL structured input is invalid");
 		GuardedDDLIntent d;
@@ -38,14 +38,19 @@ struct GuardedDDLIntent {
 			throw BinderException("DDL structured input is invalid");
 		const auto &types = StructType::GetChildTypes(v.type());
 		const auto &fields = StructValue::GetChildren(v);
-		const vector<string> names = {"contract_version", "target_contract", "action",	"name",
-									  "index_name",		  "owner",			 "columns", "keys"};
+		vector<string> names = {"contract_version", "target_contract", "action", "name", "index_name", "owner"};
+		if (contract == 3) {
+			names.push_back("new_name");
+			names.push_back("column_name");
+		}
+		names.push_back("columns");
+		names.push_back("keys");
 		if (types.size() != names.size())
 			throw BinderException("DDL fields are invalid");
 		for (idx_t i = 0; i < names.size(); i++)
 			if (types[i].first != names[i] || fields[i].IsNull())
 				throw BinderException("DDL fields are invalid");
-		if (fields[0].type().id() != LogicalTypeId::INTEGER || fields[0].GetValue<int32_t>() != 2 ||
+		if (fields[0].type().id() != LogicalTypeId::INTEGER || fields[0].GetValue<int32_t>() != contract ||
 			Text(fields[1]) != "EXECUTION_NAME")
 			throw BinderException("DDL contract is unavailable");
 		d.action = Text(fields[2]);
@@ -54,10 +59,20 @@ struct GuardedDDLIntent {
 		d.owner = Text(fields[5]);
 		if (!Name(d.name) || (!d.index.empty() && !Name(d.index)) || (!d.owner.empty() && !Name(d.owner)))
 			throw BinderException("DDL target name is invalid");
-		if (fields[6].type().id() != LogicalTypeId::LIST || fields[7].type().id() != LogicalTypeId::LIST)
+		const idx_t offset = contract == 3 ? 2 : 0;
+		if (contract == 3) {
+			d.new_name = Text(fields[6]);
+			d.column_name = Text(fields[7]);
+			if ((!d.new_name.empty() && !Name(d.new_name)) || (!d.column_name.empty() && !Name(d.column_name)))
+				throw BinderException("DDL altered name is invalid");
+		}
+		const bool extended_action = d.action == "rename_table" || d.action == "add_column" || d.action == "rename_column" || d.action == "rename_index";
+		if (extended_action != (contract == 3))
+			throw BinderException("DDL action requires a different contract");
+		if (fields[6 + offset].type().id() != LogicalTypeId::LIST || fields[7 + offset].type().id() != LogicalTypeId::LIST)
 			throw BinderException("DDL payload is invalid");
-		const auto &cols = ListValue::GetChildren(fields[6]);
-		const auto &keys = ListValue::GetChildren(fields[7]);
+		const auto &cols = ListValue::GetChildren(fields[6 + offset]);
+		const auto &keys = ListValue::GetChildren(fields[7 + offset]);
 		if (cols.size() > 256 || keys.size() > 32)
 			throw BinderException("DDL payload bound exceeded");
 		auto quote = [&](const string &s) { return KeywordHelper::WriteQuoted(s, mysql ? '`' : '"'); };
@@ -121,6 +136,25 @@ struct GuardedDDLIntent {
 				throw BinderException("DDL drop index options are invalid");
 			d.sql = "DROP INDEX " +
 					(mysql ? quote(d.name) + " ON " + quote(d.schema) + "." + quote(d.owner) : target + " RESTRICT");
+		} else if (d.action == "rename_table") {
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || !d.column_name.empty() || d.new_name.empty() || d.new_name == d.name)
+				throw BinderException("DDL rename table options are invalid");
+			d.sql = mysql ? "RENAME TABLE " + target + " TO " + quote(d.schema) + "." + quote(d.new_name)
+			              : "ALTER TABLE " + target + " RENAME TO " + quote(d.new_name);
+		} else if (d.action == "add_column") {
+			if (d.columns.size() != 1 || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || !d.column_name.empty() || !d.new_name.empty())
+				throw BinderException("DDL add column options are invalid");
+			// ONLY prevents implicit propagation into PG inheritance children.
+			d.sql = "ALTER TABLE " + string(mysql ? "" : "ONLY ") + target + " ADD COLUMN " + d.columns[0];
+		} else if (d.action == "rename_column") {
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || d.column_name.empty() || d.new_name.empty() || d.new_name == d.column_name)
+				throw BinderException("DDL rename column options are invalid");
+			d.sql = "ALTER TABLE " + string(mysql ? "" : "ONLY ") + target + " RENAME COLUMN " + quote(d.column_name) + " TO " + quote(d.new_name);
+		} else if (d.action == "rename_index") {
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.column_name.empty() || d.new_name.empty() || d.new_name == d.name || (mysql ? d.owner.empty() : !d.owner.empty()))
+				throw BinderException("DDL rename index options are invalid");
+			d.sql = mysql ? "ALTER TABLE " + quote(d.schema) + "." + quote(d.owner) + " RENAME INDEX " + quote(d.name) + " TO " + quote(d.new_name)
+			              : "ALTER INDEX " + target + " RENAME TO " + quote(d.new_name);
 		} else {
 			throw BinderException("DDL action is unsupported");
 		}
