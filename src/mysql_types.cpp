@@ -1,6 +1,60 @@
 #include "mysql_types.hpp"
+#include "duckdb/common/exception/conversion_exception.hpp"
 
 namespace duckdb {
+
+Value MySQLTypes::DecodeTextValue(const MySQLTypeConfig &config, const LogicalType &type, enum_field_types mysql_type,
+                                 const char *data, idx_t length) {
+	if (!data) {
+		return Value(type);
+	}
+	string text(data, length);
+	if (type.id() == LogicalTypeId::BLOB) {
+		return Value::BLOB_RAW(text);
+	}
+	if (mysql_type == MYSQL_TYPE_BIT && type.id() == LogicalTypeId::BOOLEAN) {
+		if (length != 1 || static_cast<unsigned char>(data[0]) > 1) {
+			throw ConversionException("Invalid MySQL BIT(1) text-protocol value");
+		}
+		return Value::BOOLEAN(data[0] != 0);
+	}
+	if (type.id() == LogicalTypeId::DATE || type.id() == LogicalTypeId::TIMESTAMP) {
+		bool zero = text == "0000-00-00" || text == "0000-00-00 00:00:00" ||
+		            (text.size() > 20 && text.substr(0, 20) == "0000-00-00 00:00:00." &&
+		             text.find_first_not_of('0', 20) == string::npos);
+		bool incomplete = text.size() >= 10 &&
+		                  (text.substr(5, 2) == "00" || text.substr(8, 2) == "00");
+		if (zero || (config.incomplete_dates_as_nulls && incomplete)) {
+			return Value(type);
+		}
+	}
+	// Integer text cannot borrow DuckDB's permissive fractional/exponent casts.
+	// Type is selected from MYSQL_FIELD, never inferred from the cell contents.
+	bool integer = (type.id() >= LogicalTypeId::TINYINT && type.id() <= LogicalTypeId::BIGINT) ||
+	               (type.id() >= LogicalTypeId::UTINYINT && type.id() <= LogicalTypeId::UBIGINT);
+	if (integer || type.id() == LogicalTypeId::DECIMAL) {
+		idx_t pos = !text.empty() && (text[0] == '-' || text[0] == '+') ? 1 : 0;
+		bool digit = false, point = false;
+		idx_t fractional = 0;
+		for (; pos < text.size(); pos++) {
+			char c = text[pos];
+			if (c >= '0' && c <= '9') {
+				digit = true;
+				if (point) {
+					fractional++;
+				}
+			} else if (!integer && c == '.' && !point) {
+				point = true;
+			} else {
+				throw ConversionException("Invalid MySQL numeric text-protocol value");
+			}
+		}
+		if (!digit || (!integer && fractional > DecimalType::GetScale(type))) {
+			throw ConversionException("MySQL numeric text-protocol value exceeds its declared scale");
+		}
+	}
+	return Value(text).DefaultCastAs(type, true);
+}
 
 static bool GetBoolOption(ClientContext &context, const std::string &opt_name) {
 	Value val;

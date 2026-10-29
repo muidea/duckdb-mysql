@@ -83,7 +83,8 @@ private:
 
 class MySQLTextResult : public MySQLResultReader {
 public:
-	MySQLTextResult(const std::string &query_p, MySQLResultPtr result_p, idx_t affected_rows_p);
+	MySQLTextResult(const std::string &query_p, MySQLResultPtr result_p, idx_t affected_rows_p,
+	                const MySQLTypeConfig &type_config_p);
 	~MySQLTextResult() override = default;
 
 	string GetString(idx_t col) override;
@@ -102,6 +103,7 @@ private:
 
 	string query;
 	MySQLResultPtr result;
+	MySQLTypeConfig type_config;
 	idx_t affected_rows = static_cast<idx_t>(-1);
 	vector<MySQLField> fields;
 	DataChunk data_chunk;

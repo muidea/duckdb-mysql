@@ -161,7 +161,7 @@ unique_ptr<MySQLTextResult> MySQLConnection::QueryText(const string &query) {
 
 	auto result = MySQLResultPtr(mysql_store_result(con), MySQLResultDelete);
 	auto affected_rows = mysql_affected_rows(con);
-	return make_uniq<MySQLTextResult>(query, std::move(result), affected_rows);
+	return make_uniq<MySQLTextResult>(query, std::move(result), affected_rows, type_config);
 }
 
 unique_ptr<MySQLResult> MySQLConnection::Query(MySQLStatement &stmt, const vector<Value> &params,

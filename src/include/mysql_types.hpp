@@ -43,6 +43,8 @@ public:
 	static LogicalType ToMySQLType(const MySQLTypeConfig &type_config, const LogicalType &input);
 	static LogicalType TypeToLogicalType(const MySQLTypeConfig &type_config, const MySQLTypeData &input);
 	static LogicalType FieldToLogicalType(const MySQLTypeConfig &type_config, MYSQL_FIELD *field);
+	static Value DecodeTextValue(const MySQLTypeConfig &config, const LogicalType &type, enum_field_types mysql_type,
+	                             const char *data, idx_t length);
 	static string TypeToString(const LogicalType &input);
 };
 

@@ -710,6 +710,7 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 			time_zone = mysql_session_time_zone.ToString();
 		}
 		auto conn = mysql_catalog.GetConnectionPool().Acquire(acquire_mode, time_zone);
+		conn->SetTypeConfig(MySQLTypeConfig(context));
 		auto bind_sql = "SELECT * FROM (" + StripTrailingSemicolon(sql) + ") AS __duckdb_mysql_query LIMIT 0";
 		auto result = conn.GetConnection().QueryText(bind_sql);
 		for (auto &field : result->Fields()) {

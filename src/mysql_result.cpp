@@ -251,8 +251,9 @@ const vector<MySQLField> &MySQLResult::Fields() {
 	return fields;
 }
 
-MySQLTextResult::MySQLTextResult(const std::string &query_p, MySQLResultPtr result_p, idx_t affected_rows_p)
-    : query(query_p), result(std::move(result_p)), affected_rows(affected_rows_p) {
+MySQLTextResult::MySQLTextResult(const std::string &query_p, MySQLResultPtr result_p, idx_t affected_rows_p,
+                               const MySQLTypeConfig &type_config_p)
+    : query(query_p), result(std::move(result_p)), type_config(type_config_p), affected_rows(affected_rows_p) {
 	if (!result) {
 		vector<LogicalType> empty_types;
 		data_chunk.Initialize(Allocator::DefaultAllocator(), empty_types);
@@ -269,12 +270,12 @@ MySQLTextResult::MySQLTextResult(const std::string &query_p, MySQLResultPtr resu
 	vector<LogicalType> ltypes;
 	fields.reserve(field_count);
 	ltypes.reserve(field_count);
-	MySQLTypeConfig type_config;
 	for (idx_t i = 0; i < field_count; i++) {
 		auto &mf = mfields[i];
-		MySQLField field(&mf, LogicalType::VARCHAR, type_config);
+		auto logical_type = MySQLTypes::FieldToLogicalType(type_config, &mf);
+		MySQLField field(&mf, logical_type, type_config);
 		fields.push_back(std::move(field));
-		ltypes.push_back(LogicalType::VARCHAR);
+		ltypes.push_back(std::move(logical_type));
 	}
 	data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
 }
@@ -294,10 +295,7 @@ void MySQLTextResult::CheckNotNull(idx_t col) {
 
 string MySQLTextResult::GetString(idx_t col) {
 	CheckNotNull(col);
-	Vector &vec = data_chunk.data[col];
-	string_t *data = FlatVector::GetData<string_t>(vec);
-	string_t &st = data[row_idx];
-	return string(st.GetData(), st.GetSize());
+	return data_chunk.GetValue(col, row_idx).DefaultCastAs(LogicalType::VARCHAR).ToString();
 }
 
 int32_t MySQLTextResult::GetInt32(idx_t col) {
@@ -306,7 +304,7 @@ int32_t MySQLTextResult::GetInt32(idx_t col) {
 
 int64_t MySQLTextResult::GetInt64(idx_t col) {
 	CheckNotNull(col);
-	return std::atoll(GetString(col).c_str());
+	return data_chunk.GetValue(col, row_idx).DefaultCastAs(LogicalType::BIGINT, true).GetValue<int64_t>();
 }
 
 bool MySQLTextResult::IsNull(idx_t col) {
@@ -342,8 +340,9 @@ DataChunk &MySQLTextResult::NextChunk() {
 				FlatVector::SetNull(vec, r, true);
 				continue;
 			}
-			auto value = StringVector::AddStringOrBlob(vec, row[c], lengths[c]);
-			FlatVector::GetData<string_t>(vec)[r] = value;
+			auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type,
+			                                         row[c], lengths[c]);
+			data_chunk.SetValue(c, r, value);
 		}
 	}
 
@@ -352,9 +351,12 @@ DataChunk &MySQLTextResult::NextChunk() {
 }
 
 bool MySQLTextResult::Next() {
-	if (row_idx < data_chunk.size() - 1) {
+	if (data_chunk.size() > 0 && row_idx < data_chunk.size() - 1) {
 		row_idx += 1;
 		return true;
+	}
+	if (exhausted) {
+		return false;
 	}
 	NextChunk();
 	row_idx = 0;
