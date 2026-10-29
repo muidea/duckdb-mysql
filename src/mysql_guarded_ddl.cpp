@@ -53,6 +53,30 @@ static string Scalar(MYSQL *raw, const string &sql) {
 		throw IOException("DDL identity result unavailable");
 	return row[0];
 }
+// Feature thresholds select known MySQL syntax/semantics; there is no upper
+// version whitelist. Catalog presence independently proves CHECK enforcement.
+static bool VersionAtLeast(const string &version,int major,int minor,int patch) {
+    vector<int> parts;idx_t pos=0;
+    for(int i=0;i<3;i++) {
+        if(pos>=version.size() || version[pos]<'0' || version[pos]>'9') return false;
+        int value=0;
+        while(pos<version.size() && version[pos]>='0' && version[pos]<='9') { if(value>100000) return false;value=value*10+version[pos++]-'0'; }
+        parts.push_back(value);if(i<2 && (pos>=version.size() || version[pos++]!='.')) return false;
+    }
+    return parts>=vector<int>{major,minor,patch};
+}
+static string SessionReadOnly(MYSQL *raw) {
+    const string sql="SHOW SESSION VARIABLES WHERE Variable_name IN ('transaction_read_only','tx_read_only')";
+    if(mysql_real_query(raw,sql.c_str(),sql.size())) throw IOException("DDL session capability unavailable");
+    unique_ptr<MYSQL_RES,decltype(&mysql_free_result)> result(mysql_store_result(raw),mysql_free_result);
+    if(!result || mysql_num_fields(result.get())!=2 || mysql_num_rows(result.get())<1 || mysql_num_rows(result.get())>2) throw IOException("DDL session capability unavailable");
+    string value="0";MYSQL_ROW row;
+    while((row=mysql_fetch_row(result.get()))) {
+        if(!row[1])throw IOException("DDL session capability unavailable");
+        string flag=row[1];if(flag=="ON" || flag=="1") value="1";else if(flag!="OFF" && flag!="0")throw IOException("DDL session capability unavailable");
+    }
+    return value;
+}
 static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	auto &state = in.global_state->Cast<State>();
 	if (state.done)
@@ -84,24 +108,22 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		bool distribution =
 		    ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
 		    ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
-		if ((version.find("5.7.") != 0 && version.find("8.0.") != 0) ||
-		    (!distribution && comment.find("MySQL") == string::npos) ||
+		if ((!distribution && comment.find("MySQL") == string::npos) ||
 		    Scalar(raw, "SELECT DATABASE()") != d.intent.database) {
 			error = "0A000";
 			throw IOException("DDL source not certified");
 		}
-		if (d.intent.action == "rename_column" && version.find("8.0.") != 0) {
+		if (d.intent.action == "rename_column" && !VersionAtLeast(version,8,0,0)) {
 			error = "0A000";
 			throw IOException("DDL column rename has no equivalent native syntax");
 		}
 		if (d.intent.action == "add_constraint" && d.intent.constraint_kind == "check" &&
-		    (version.find("8.0.") != 0 || std::stoi(version.substr(4)) < 16)) {
+		    (!VersionAtLeast(version,8,0,16) || Scalar(raw,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='TABLE_CONSTRAINTS' AND COLUMN_NAME='ENFORCED'")!="1")) {
 			error = "0A000";
 			throw IOException("DDL enforced CHECK is unavailable");
 		}
 		if (Scalar(raw, "SELECT CAST(@@read_only AS CHAR)") != "0" ||
-		    Scalar(raw, version.find("5.7.") == 0 ? "SELECT CAST(@@session.tx_read_only AS CHAR)"
-		                                          : "SELECT CAST(@@session.transaction_read_only AS CHAR)") != "0") {
+		    SessionReadOnly(raw) != "0") {
 			error = "25006";
 			throw IOException("DDL source read only");
 		}
@@ -147,7 +169,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 				native_sql = "ALTER TABLE " + target + " DROP INDEX " + name;
 			else if (kind == "FOREIGN KEY")
 				native_sql = "ALTER TABLE " + target + " DROP FOREIGN KEY " + name;
-			else if (kind == "CHECK" && version.find("8.0.") == 0)
+			else if (kind == "CHECK" && VersionAtLeast(version,8,0,16))
 				native_sql = "ALTER TABLE " + target + " DROP CHECK " + name;
 			// If no supported catalog kind is visible, send the original
 			// native DROP CONSTRAINT form and retain the source's own error.

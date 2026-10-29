@@ -36,6 +36,10 @@ struct Data : TableFunctionData {
     string schema, table, expected, version, sql;
     vector<Value> params;
     bool execute;
+    bool returning=false;
+    string returning_name;
+    int64_t returning_oid=0;
+    vector<Value> returning_keys;
     Data(MySQLCatalog &c, bool exec) : catalog(c), execute(exec) {}
 };
 struct State : GlobalTableFunctionState { bool done = false; };
@@ -51,8 +55,18 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
         data->expected=in.inputs[3].GetValue<string>(); data->version=in.inputs[4].GetValue<string>(); data->sql=in.inputs[5].GetValue<string>();
         auto it=in.named_parameters.find("params"); if (it!=in.named_parameters.end()) data->params=StructValue::GetChildren(it->second);
     }
+    data->returning = in.table_function.name=="mysql_guarded_insert_returning_v1";
+    if(data->returning) {
+        auto name=in.named_parameters.find("returning_name"),oid=in.named_parameters.find("returning_oid");
+        if(name==in.named_parameters.end() || oid==in.named_parameters.end() || name->second.IsNull() || oid->second.IsNull()) Reject();
+        data->returning_name=name->second.GetValue<string>();data->returning_oid=oid->second.GetValue<int64_t>();
+        if(!SimpleName(data->returning_name) || (data->returning_oid!=20 && data->returning_oid!=21 && data->returning_oid!=23)) Reject();
+        auto keys=in.named_parameters.find("returning_keys");if(keys!=in.named_parameters.end()) data->returning_keys=StructValue::GetChildren(keys->second);
+        if(data->returning_keys.size()>4096) Reject();
+    }
     names={"status","affected_rows","sqlstate","stage","version","descriptor"};
     types={LogicalType::VARCHAR,LogicalType::BIGINT,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR};
+    if(data->returning) { names.push_back("returned_rows");types.push_back(LogicalType::VARCHAR); }
     return std::move(data);
 }
 static unique_ptr<MySQLResult> Query(MySQLConnection &c,const string &sql,const vector<Value> &params={}) {
@@ -74,6 +88,21 @@ static void CheckVisibility(MySQLConnection &c,const string &schema) {
     }
     if (!visible) Reject("42501", "capability_permission"); // Missing TRIGGER visibility must never certify an empty trigger list.
 }
+static string StableCreate(const string &ddl) {
+    string out; char quote=0;int depth=0;
+    for(idx_t i=0;i<ddl.size();) {
+        char ch=ddl[i];
+        if(quote) { out+=ch;i++;if(ch==quote) { if(i<ddl.size() && ddl[i]==quote) {out+=ddl[i++];}else quote=0; }continue; }
+        if(ch=='\'' || ch=='`' || ch=='"') { quote=ch;out+=ch;i++;continue; }
+        if(ch=='(') depth++;if(ch==')') depth--;
+        if(depth==0 && ddl.compare(i,16," AUTO_INCREMENT=")==0) {
+            auto end=i+16;while(end<ddl.size() && ddl[end]>='0' && ddl[end]<='9') end++;
+            if(end==i+16 || (end<ddl.size() && ddl[end]!=' ')) Reject();i=end;continue;
+        }
+        out+=ch;i++;
+    }
+    return out;
+}
 static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
     vector<Value> args={Value(d.schema),Value(d.table)};
     auto table=Query(c,"SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",args);
@@ -84,14 +113,17 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
         {Value(d.schema),Value(d.table),Value(d.schema),Value(d.table),Value(d.schema),Value(d.table)});
     if (features!="0") Reject();
     auto create=Query(c,"SHOW CREATE TABLE "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table));
-    if (!create->Next()) Reject(); auto ddl=create->GetString(1);
+    if (!create->Next()) Reject(); auto ddl=StableCreate(create->GetString(1));
     string out="{\"database\":"+Quote(d.schema)+",\"table\":"+Quote(d.table)+",\"table_id\":"+Quote(id)+",\"create_sql\":"+Quote(ddl)+",\"columns\":[";
-    auto cols=Query(c,"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COALESCE(CHARACTER_SET_NAME,''),COALESCE(COLLATION_NAME,''),EXTRA,GENERATION_EXPRESSION,COLUMN_DEFAULT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 4097",args);
+    auto cols=Query(c,"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COALESCE(CHARACTER_SET_NAME,''),COALESCE(COLLATION_NAME,''),EXTRA,GENERATION_EXPRESSION,COLUMN_DEFAULT,CAST((SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=c.TABLE_SCHEMA AND k.TABLE_NAME=c.TABLE_NAME AND k.INDEX_NAME='PRIMARY') AS CHAR),COLUMN_KEY FROM information_schema.COLUMNS c WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 4097",args);
     bool first=true;
     while(cols->Next()) {
-        if (!cols->GetString(6).empty() || !cols->GetString(7).empty() || !cols->IsNull(8)) Reject();
+        bool automatic=cols->GetString(6)=="auto_increment";
+        bool primary=cols->GetString(9)=="1" && cols->GetString(10)=="PRI";
+        if ((!cols->GetString(6).empty() && !automatic) || !cols->GetString(7).empty() || !cols->IsNull(8) ||
+            (automatic && (!primary || (cols->GetString(1)!="smallint" && cols->GetString(1)!="int" && cols->GetString(1)!="bigint") || cols->GetString(2).find("unsigned")!=string::npos))) Reject();
         if (!first) out+=","; first=false;
-        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+"}";
+        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false")+"}";
         if (out.size()>1024*1024) Reject();
     }
     return out+"]}";
@@ -106,7 +138,7 @@ static string ErrorState(unsigned int code) {
 static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
     auto &state=in.global_state->Cast<State>(); if (state.done)return; state.done=true;
     auto &d=in.bind_data->Cast<Data>(); string status="CONFIRMED_NOT_EXECUTED",error,stage="source_metadata",version,descriptor;
-    int64_t affected=-1; bool sent=false,finished=false;
+    int64_t affected=-1; bool sent=false,finished=false;string returned_rows="[";bool automatic_key=false;
     MySQLPooledConnection pooled;
     unique_ptr<GuardedCRUDDeadline> deadline;
     try {
@@ -148,6 +180,12 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         if (d.execute) {
             stage="source_descriptor";
             if (descriptor!=d.expected) {error="0A000";Reject();}
+            if(d.returning) {
+                auto key=Query(c,"SELECT DATA_TYPE,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? AND COLUMN_KEY='PRI' AND IS_NULLABLE='NO' AND (SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=? AND k.TABLE_NAME=? AND k.INDEX_NAME='PRIMARY')=1",{Value(d.schema),Value(d.table),Value(d.returning_name),Value(d.schema),Value(d.table)});
+                if(!key->Next()) Reject();auto type=key->GetString(0);automatic_key=key->GetString(1)=="auto_increment";
+                auto oid=type=="smallint"?21:type=="int"||type=="mediumint"?23:type=="bigint"?20:0;
+                if(oid!=d.returning_oid || key->Next() || (d.returning_keys.empty() && !automatic_key)) Reject();
+            }
             if (ctx.IsInterrupted()) {error="57014";throw InterruptException();}
             stage="source_execute";
             MySQLStatementPtr prepared(mysql_stmt_init(c.GetConn()),MySQLStatementDelete);
@@ -162,6 +200,29 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
                 affected=result->AffectedRows();
             } catch (...) {error=ErrorState(mysql_stmt_errno(raw_statement));throw;}
             if (mysql_warning_count(c.GetConn())!=0) {error="01000";Reject();}
+            if(d.returning) {
+                vector<Value> keys=d.returning_keys;
+                if(keys.empty()) {
+                    auto id=mysql_stmt_insert_id(raw_statement);
+                    if(affected!=1 || id==0 || id>9223372036854775807ULL) Reject();
+                    keys.push_back(Value::BIGINT(static_cast<int64_t>(id)));
+                }
+                if(affected<1 || affected>4096 || affected!=static_cast<int64_t>(keys.size())) Reject();
+                string selectors;
+                for(auto &v:keys) {
+                    if(v.IsNull() || (v.type().id()!=LogicalTypeId::SMALLINT && v.type().id()!=LogicalTypeId::INTEGER && v.type().id()!=LogicalTypeId::BIGINT)) Reject();
+                    if(!selectors.empty())selectors+=",";selectors+="?";
+                }
+                auto rows=Query(c,"SELECT CAST("+MySQLUtils::WriteIdentifier(d.returning_name)+" AS CHAR) FROM "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table)+" WHERE "+MySQLUtils::WriteIdentifier(d.returning_name)+" IN ("+selectors+")",keys);
+                int64_t count=0;
+                while(rows->Next()) {
+                    if(rows->IsNull(0) || ++count>affected) Reject();
+                    auto id=rows->GetString(0);
+                    if(id.empty() || id.size()>20 || id.find_first_not_of("0123456789-")!=string::npos) Reject();
+                    if(count>1)returned_rows+=",";returned_rows+="["+Quote(id)+"]";
+                }
+                if(count!=affected || mysql_warning_count(c.GetConn())!=0) Reject();returned_rows+="]";
+            }
             stage="source_commit";status="COMMIT_STATUS_UNKNOWN";finished=true;
             c.Execute("COMMIT"); status="COMMITTED";stage.clear();
         } else {c.Execute("ROLLBACK");finished=true;stage.clear();}
@@ -184,9 +245,15 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
     out.SetCardinality(1);
     out.SetValue(0,0,Value(status));out.SetValue(1,0,Value::BIGINT(affected));out.SetValue(2,0,Value(error));
     out.SetValue(3,0,Value(stage));out.SetValue(4,0,Value(version));out.SetValue(5,0,Value(descriptor));
+    if(d.returning)out.SetValue(6,0,Value(status=="COMMITTED"?returned_rows:""));
 }
 }
 void RegisterMySQLGuardedCRUD(ExtensionLoader &loader) {
+    TableFunction returning("mysql_guarded_insert_returning_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
+    returning.named_parameters["params"]=LogicalType::ANY;returning.named_parameters["returning_keys"]=LogicalType::ANY;
+    returning.named_parameters["returning_name"]=LogicalType::VARCHAR;returning.named_parameters["returning_oid"]=LogicalType::BIGINT;
+    loader.RegisterFunction(returning);
+
     loader.RegisterFunction(TableFunction("mysql_crud_metadata_v1",vector<LogicalType>(3,LogicalType::VARCHAR),Scan,Bind,Init));
     TableFunction exec("mysql_guarded_mutation_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
     exec.named_parameters["params"]=LogicalType::ANY; loader.RegisterFunction(exec);

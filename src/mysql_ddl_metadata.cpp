@@ -190,11 +190,15 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			           {Value(d.schema), Value(d.name), Value(d.kind), Value(d.schema), Value(d.schema), Value(d.name),
 			            Value(d.schema), Value(d.kind), Value(d.name), Value(d.kind), Value(d.name)});
 		} else {
-			// tx_read_only was renamed in 8.0; query only the variable supported by
-			// this server. Global read_only alone does not describe a read-only session.
-			auto session_read_only =
-			    Scalar(c, version.find("5.7.") == 0 ? "SELECT CAST(@@session.tx_read_only AS CHAR)"
-			                                        : "SELECT CAST(@@session.transaction_read_only AS CHAR)");
+            auto settings=c.Query("SHOW SESSION VARIABLES WHERE Variable_name IN ('transaction_read_only','tx_read_only')",{},MySQLResultStreaming::FORCE_MATERIALIZATION);
+            string session_read_only="0";idx_t flags=0;
+            while(settings->Next()) {
+                flags++;if(settings->IsNull(1))throw IOException("DDL session capability unavailable");
+                auto flag=settings->GetString(1);
+                if(flag=="ON" || flag=="1")session_read_only="1";
+                else if(flag!="OFF" && flag!="0")throw IOException("DDL session capability unavailable");
+            }
+            if(flags<1 || flags>2)throw IOException("DDL session capability unavailable");
 			document = Scalar(c, CapabilitiesSQL, {Value(d.schema), Value(d.schema), Value(session_read_only)});
 		}
 		if (document.size() > 1024 * 1024 || mysql_warning_count(c.GetConn()) != 0) {
