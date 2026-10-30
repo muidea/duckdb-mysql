@@ -240,6 +240,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	mysql_library_init(0, NULL, NULL);
 	MySQLClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
+	MySQLClearCacheFunction scoped_clear_cache_func(true);
+	loader.RegisterFunction(scoped_clear_cache_func);
 
 	MySQLExecuteFunction execute_function;
 	loader.RegisterFunction(execute_function);

@@ -85,7 +85,7 @@ public:
 
 class MySQLClearCacheFunction : public TableFunction {
 public:
-	MySQLClearCacheFunction();
+	explicit MySQLClearCacheFunction(bool scoped = false);
 
 	static void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
 };
