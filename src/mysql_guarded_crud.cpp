@@ -1,4 +1,5 @@
 #include "duckdb.hpp"
+#include "guarded_source_error.hpp"
 #include "guarded_crud_deadline.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -36,6 +37,7 @@ struct Data : TableFunctionData {
     string schema, table, expected, version, sql;
     vector<Value> params;
     bool execute;
+    bool diagnostics = false;
     bool returning=false;
     string returning_name;
     int64_t returning_oid=0;
@@ -67,6 +69,9 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
     names={"status","affected_rows","sqlstate","stage","version","descriptor"};
     types={LogicalType::VARCHAR,LogicalType::BIGINT,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR};
     if(data->returning) { names.push_back("returned_rows");types.push_back(LogicalType::VARCHAR); }
+    auto diagnostics = in.named_parameters.find("source_diagnostics");
+    data->diagnostics = diagnostics != in.named_parameters.end() && !diagnostics->second.IsNull() && diagnostics->second.GetValue<bool>();
+    if (data->diagnostics) { names.push_back("source_error"); types.push_back(LogicalType::VARCHAR); }
     return std::move(data);
 }
 static unique_ptr<MySQLResult> Query(MySQLConnection &c,const string &sql,const vector<Value> &params={}) {
@@ -120,10 +125,15 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
     while(cols->Next()) {
         bool automatic=cols->GetString(6)=="auto_increment";
         bool primary=cols->GetString(9)=="1" && cols->GetString(10)=="PRI";
-        if ((!cols->GetString(6).empty() && !automatic) || !cols->GetString(7).empty() || !cols->IsNull(8) ||
+        if ((!cols->GetString(6).empty() && !automatic) || !cols->GetString(7).empty() ||
             (automatic && (!primary || (cols->GetString(1)!="smallint" && cols->GetString(1)!="int" && cols->GetString(1)!="bigint") || cols->GetString(2).find("unsigned")!=string::npos))) Reject();
+        // Literal defaults remain source semantics, never translated into SQL.
+        // Generated/ON UPDATE expressions stay outside this contract. Older
+        // MySQL versions do not mark CURRENT_TIMESTAMP DEFAULT_GENERATED.
+        if (!cols->IsNull(8) && (cols->GetString(1)=="datetime" || cols->GetString(1)=="timestamp") &&
+            StringUtil::Upper(cols->GetString(8)).find("CURRENT_TIMESTAMP")==0) Reject();
         if (!first) out+=","; first=false;
-        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false")+"}";
+        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"has_default\":"+(!cols->IsNull(8)?"true":"false")+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false")+"}";
         if (out.size()>1024*1024) Reject();
     }
     return out+"]}";
@@ -135,9 +145,22 @@ static string ErrorState(unsigned int code) {
     case 2002:case 2003:case 2006:case 2013:case 2055:return "08006";
     default:return "HY000";}
 }
+static GuardedSourceError SourceError(MYSQL *raw, MYSQL_STMT *statement = nullptr) {
+    GuardedSourceError result;
+    auto code = statement ? mysql_stmt_errno(statement) : mysql_errno(raw);
+    if (!code) return result;
+    result.product = "mysql";
+    auto state = statement ? mysql_stmt_sqlstate(statement) : mysql_sqlstate(raw);
+    result.state = state && strlen(state)==5 ? state : "HY000";
+    result.code = std::to_string(code);
+    auto message = statement ? mysql_stmt_error(statement) : mysql_error(raw);
+    result.message = message ? message : "";
+    return result;
+}
 static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
     auto &state=in.global_state->Cast<State>(); if (state.done)return; state.done=true;
     auto &d=in.bind_data->Cast<Data>(); string status="CONFIRMED_NOT_EXECUTED",error,stage="source_metadata",version,descriptor;
+    GuardedSourceError source;
     int64_t affected=-1; bool sent=false,finished=false;string returned_rows="[";bool automatic_key=false;
     MySQLPooledConnection pooled;
     unique_ptr<GuardedCRUDDeadline> deadline;
@@ -190,7 +213,7 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
             stage="source_execute";
             MySQLStatementPtr prepared(mysql_stmt_init(c.GetConn()),MySQLStatementDelete);
             if (!prepared) Reject();
-            if (mysql_stmt_prepare(prepared.get(),d.sql.c_str(),d.sql.size())!=0) {error=ErrorState(mysql_stmt_errno(prepared.get()));Reject();}
+            if (mysql_stmt_prepare(prepared.get(),d.sql.c_str(),d.sql.size())!=0) {source=SourceError(c.GetConn(),prepared.get());error=ErrorState(mysql_stmt_errno(prepared.get()));Reject();}
             auto statement=make_uniq<MySQLStatement>(d.sql,prepared.release(),vector<MySQLField>());
             if (mysql_stmt_field_count(statement->get())!=0 || mysql_stmt_param_count(statement->get())!=d.params.size()) Reject();
             auto raw_statement=statement->get();
@@ -198,7 +221,7 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
             try {
                 auto result=c.Query(*statement,d.params,MySQLResultStreaming::FORCE_MATERIALIZATION);
                 affected=result->AffectedRows();
-            } catch (...) {error=ErrorState(mysql_stmt_errno(raw_statement));throw;}
+            } catch (...) {source=SourceError(c.GetConn(),raw_statement);error=ErrorState(mysql_stmt_errno(raw_statement));throw;}
             if (mysql_warning_count(c.GetConn())!=0) {error="01000";Reject();}
             if(d.returning) {
                 vector<Value> keys=d.returning_keys;
@@ -230,6 +253,7 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         if (error.empty()) error = rejection.state;
         if (!sent && stage != "source_descriptor" && stage != "source_execute") stage = rejection.stage;
     } catch (...) {
+        if (source.message.empty() && pooled) source=SourceError(pooled.GetConnection().GetConn());
         if (error.empty()) error=ctx.IsInterrupted()?"57014":
             (pooled ? ErrorState(mysql_errno(pooled.GetConnection().GetConn())) : "08006");
     }
@@ -243,6 +267,7 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         pooled.Invalidate(); // No transport reconnect/retry, no session state reuse.
     }
     out.SetCardinality(1);
+    if (d.diagnostics) out.SetValue(6 + (d.returning ? 1 : 0), 0, Value(source.JSON()));
     out.SetValue(0,0,Value(status));out.SetValue(1,0,Value::BIGINT(affected));out.SetValue(2,0,Value(error));
     out.SetValue(3,0,Value(stage));out.SetValue(4,0,Value(version));out.SetValue(5,0,Value(descriptor));
     if(d.returning)out.SetValue(6,0,Value(status=="COMMITTED"?returned_rows:""));
@@ -252,10 +277,14 @@ void RegisterMySQLGuardedCRUD(ExtensionLoader &loader) {
     TableFunction returning("mysql_guarded_insert_returning_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
     returning.named_parameters["params"]=LogicalType::ANY;returning.named_parameters["returning_keys"]=LogicalType::ANY;
     returning.named_parameters["returning_name"]=LogicalType::VARCHAR;returning.named_parameters["returning_oid"]=LogicalType::BIGINT;
+    returning.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
     loader.RegisterFunction(returning);
 
-    loader.RegisterFunction(TableFunction("mysql_crud_metadata_v1",vector<LogicalType>(3,LogicalType::VARCHAR),Scan,Bind,Init));
+    TableFunction metadata("mysql_crud_metadata_v1",vector<LogicalType>(3,LogicalType::VARCHAR),Scan,Bind,Init);
+    metadata.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
+    loader.RegisterFunction(metadata);
     TableFunction exec("mysql_guarded_mutation_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
+    exec.named_parameters["source_diagnostics"]=LogicalType::BOOLEAN;
     exec.named_parameters["params"]=LogicalType::ANY; loader.RegisterFunction(exec);
 }
 }

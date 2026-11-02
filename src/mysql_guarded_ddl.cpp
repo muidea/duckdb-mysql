@@ -2,6 +2,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "guarded_crud_deadline.hpp"
+#include "guarded_source_error.hpp"
 #include "guarded_ddl_intent.hpp"
 #include "storage/mysql_catalog.hpp"
 
@@ -10,6 +11,7 @@ namespace {
 struct Data : TableFunctionData {
 	MySQLCatalog &catalog;
 	GuardedDDLIntent intent;
+    bool diagnostics = false;
 	Data(MySQLCatalog &c, GuardedDDLIntent d) : catalog(c), intent(std::move(d)) {
 	}
 };
@@ -28,7 +30,11 @@ static unique_ptr<FunctionData> BindContract(ClientContext &ctx, TableFunctionBi
 	names = {"operation_id", "status", "sqlstate", "stage", "warning_count"};
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	         LogicalType::BIGINT};
-	return make_uniq<Data>(db->GetCatalog().Cast<MySQLCatalog>(), std::move(intent));
+    auto data = make_uniq<Data>(db->GetCatalog().Cast<MySQLCatalog>(), std::move(intent));
+    auto diag=in.named_parameters.find("source_diagnostics");
+    data->diagnostics=diag!=in.named_parameters.end() && !diag->second.IsNull() && diag->second.GetValue<bool>();
+    if(data->diagnostics) { names.push_back("source_error");types.push_back(LogicalType::VARCHAR); }
+    return std::move(data);
 }
 static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
                                      vector<string> &names) {
@@ -84,6 +90,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	state.done = true;
 	auto &d = in.bind_data->Cast<Data>();
 	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_identity";
+	GuardedSourceError source;
 	MySQLPooledConnection pooled;
 	unique_ptr<GuardedCRUDDeadline> deadline;
 	bool sent = false;
@@ -177,6 +184,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		stage = "source_execute";
 		sent = true;
 		if (mysql_real_query(raw, native_sql.c_str(), native_sql.size())) {
+            source.product="mysql"; source.state=mysql_sqlstate(raw); source.code=std::to_string(mysql_errno(raw)); source.message=mysql_error(raw);
 			auto code = mysql_errno(raw);
 			const char *s = mysql_sqlstate(raw);
 			error = s && strlen(s) == 5 ? s : "HY000";
@@ -216,6 +224,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		warnings = mysql_warning_count(raw);
 		stage = warnings ? "source_warning" : "";
 	} catch (...) {
+        if(source.message.empty() && pooled) {
+            auto raw=pooled.GetConnection().GetConn();
+            if(mysql_errno(raw)) {source.product="mysql";source.state=mysql_sqlstate(raw);source.code=std::to_string(mysql_errno(raw));source.message=mysql_error(raw);}
+        }
 		if (error.empty())
 			error = ctx.IsInterrupted() ? "57014" : "08006";
 		if (sent && status != "COMMITTED")
@@ -226,6 +238,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		pooled.GetConnection().Close();
 	}
 	out.SetCardinality(1);
+    if(d.diagnostics) out.SetValue(5,0,Value(source.JSON()));
 	out.SetValue(0, 0, Value(d.intent.operation));
 	out.SetValue(1, 0, Value(status));
 	out.SetValue(2, 0, Value(error));
@@ -234,15 +247,16 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 }
 } // namespace
 void RegisterMySQLGuardedDDL(ExtensionLoader &loader) {
-	loader.RegisterFunction(TableFunction(
+  auto register_function = [&](TableFunction function) {function.named_parameters["source_diagnostics"]=LogicalType::BOOLEAN;loader.RegisterFunction(function);};
+	register_function(TableFunction(
 	    "mysql_guarded_ddl_v2",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
 	    Scan, Bind, Init));
-	loader.RegisterFunction(TableFunction(
+	register_function(TableFunction(
 	    "mysql_guarded_ddl_v3",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
 	    Scan, BindV3, Init));
-	loader.RegisterFunction(TableFunction(
+	register_function(TableFunction(
 	    "mysql_guarded_ddl_v4",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
 	    Scan, BindV4, Init));
