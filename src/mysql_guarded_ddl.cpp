@@ -4,6 +4,7 @@
 #include "guarded_crud_deadline.hpp"
 #include "guarded_source_error.hpp"
 #include "guarded_ddl_intent.hpp"
+#include "mysql_column_rename.hpp"
 #include "storage/mysql_catalog.hpp"
 
 namespace duckdb {
@@ -83,6 +84,121 @@ static string SessionReadOnly(MYSQL *raw) {
     }
     return value;
 }
+static void ExecuteControl(MYSQL *raw, const string &sql) {
+	if (mysql_real_query(raw, sql.c_str(), sql.size())) {
+		throw IOException("DDL source control failed");
+	}
+}
+static string MetadataLiteral(const string &value) {
+	// Independent of NO_BACKSLASH_ESCAPES: this predicate is also used after
+	// enabling 5.7's SHOW CREATE string escape convention for CHANGE.
+	static const char hex[] = "0123456789abcdef";
+	string out = "CONVERT(X'";
+	for (unsigned char c : value) {
+		out += hex[c >> 4];
+		out += hex[c & 15];
+	}
+	return out + "' USING utf8mb4)";
+}
+static string ShowCreate(MYSQL *raw, const string &target) {
+	ExecuteControl(raw, "SHOW CREATE TABLE " + target);
+	unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> result(mysql_store_result(raw), mysql_free_result);
+	if (!result || mysql_num_fields(result.get()) != 2 || mysql_num_rows(result.get()) != 1 ||
+	    mysql_warning_count(raw) != 0) {
+		throw std::invalid_argument("DDL source definition unavailable");
+	}
+	auto row = mysql_fetch_row(result.get());
+	auto lengths = mysql_fetch_lengths(result.get());
+	if (!row || !lengths || !row[1] || lengths[1] > MySQLRenameDefinition::MAX_BYTES) {
+		throw std::invalid_argument("DDL source definition incomplete");
+	}
+	return string(row[1], lengths[1]);
+}
+static string ResolveColumn(MYSQL *raw, const string &target, const string &column) {
+	// Let the server resolve identifier case rules. I_S's text collation is
+	// not an identifier comparator (it can also ignore accents).
+	ExecuteControl(raw, "SELECT " + KeywordHelper::WriteQuoted(column, '`') + " FROM " + target + " LIMIT 0");
+	unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> result(mysql_store_result(raw), mysql_free_result);
+	if (!result || mysql_num_fields(result.get()) != 1) {
+		throw std::invalid_argument("DDL source column unavailable");
+	}
+	auto field = mysql_fetch_field_direct(result.get(), 0);
+	if (!field || !field->org_name || !field->org_name_length) {
+		throw std::invalid_argument("DDL source column identity unavailable");
+	}
+	return string(field->org_name, field->org_name_length);
+}
+static string DefaultHex(MYSQL *raw, const string &schema, const string &table, const string &column,
+                         const string &charset) {
+	const auto target = KeywordHelper::WriteQuoted(schema, '`') + "." + KeywordHelper::WriteQuoted(table, '`');
+	const auto expression = "SELECT HEX(DEFAULT(" + KeywordHelper::WriteQuoted(column, '`') + ")) FROM " + target;
+	for (const auto &query : {expression + " LIMIT 1",
+	                          expression + " RIGHT JOIN (SELECT 1) AS fqe_default_probe ON FALSE LIMIT 1"}) {
+		ExecuteControl(raw, query);
+		unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> result(mysql_store_result(raw), mysql_free_result);
+		if (!result || mysql_num_fields(result.get()) != 1 || mysql_num_rows(result.get()) > 1) {
+			throw IOException("DDL source default result unavailable");
+		}
+		auto row = mysql_fetch_row(result.get());
+		if (row && row[0]) {
+			return row[0];
+		}
+	}
+	// On an empty table DEFAULT(NOT NULL field) can be NULL on an outer
+	// join. COM_FIELD_LIST reads the real default record instead. Connector/C
+	// truncates this deprecated API's def at NUL and always sets def_length=0;
+	// prove there is no NUL before using its terminated text. Never guess.
+	if (charset.empty() || charset.size() > 64) {
+		throw std::invalid_argument("DDL source default character set unavailable");
+	}
+	for (auto c : charset) {
+		if (!(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '_') {
+			throw std::invalid_argument("DDL source default character set unavailable");
+		}
+	}
+	if (Scalar(raw, "SELECT LOCATE(X'00',CAST(CONVERT(COLUMN_DEFAULT USING " + charset +
+	                    ") AS BINARY)) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" +
+	                    MetadataLiteral(schema) + " AND TABLE_NAME=" + MetadataLiteral(table) +
+	                    " AND BINARY COLUMN_NAME=BINARY " + MetadataLiteral(column)) != "0") {
+		throw std::invalid_argument("DDL empty table default bytes cannot be certified");
+	}
+	ExecuteControl(raw, "SET SESSION character_set_results=binary");
+	unique_ptr<MYSQL_RES, decltype(&mysql_free_result)> result(mysql_list_fields(raw, table.c_str(), nullptr),
+	                                                        mysql_free_result);
+	if (!result) {
+		throw IOException("DDL source default record unavailable");
+	}
+	if (mysql_num_fields(result.get()) > 4096) {
+		throw std::invalid_argument("DDL source default record limit exceeded");
+	}
+	string value;
+	bool found = false;
+	for (unsigned int i = 0; i < mysql_num_fields(result.get()); i++) {
+		auto field = mysql_fetch_field_direct(result.get(), i);
+		if (!field || !field->name || string(field->name, field->name_length) != column) {
+			continue;
+		}
+		if (found || !field->def) {
+			throw std::invalid_argument("DDL source default record incomplete");
+		}
+		const auto length = strnlen(field->def, MySQLRenameDefinition::MAX_BYTES / 2 + 1);
+		if (length > MySQLRenameDefinition::MAX_BYTES / 2) {
+			throw std::invalid_argument("DDL source default record limit exceeded");
+		}
+		found = true;
+		static const char hex[] = "0123456789ABCDEF";
+		for (size_t j = 0; j < length; j++) {
+			auto c = static_cast<unsigned char>(field->def[j]);
+			value += hex[c >> 4];
+			value += hex[c & 15];
+		}
+	}
+	if (!found) {
+		throw std::invalid_argument("DDL source default record missing");
+	}
+	ExecuteControl(raw, "SET SESSION character_set_results=utf8mb4");
+	return value;
+}
 static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	auto &state = in.global_state->Cast<State>();
 	if (state.done)
@@ -120,7 +236,8 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			error = "0A000";
 			throw IOException("DDL source not certified");
 		}
-		if (d.intent.action == "rename_column" && !VersionAtLeast(version,8,0,0)) {
+		const bool change_column = d.intent.action == "rename_column" && !VersionAtLeast(version, 8, 0, 0);
+		if (change_column && !VersionAtLeast(version, 5, 7, 0)) {
 			error = "0A000";
 			throw IOException("DDL column rename has no equivalent native syntax");
 		}
@@ -140,14 +257,32 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		    "DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,NO_BACKSLASH_ESCAPES'";
 		if (mysql_real_query(raw, settings.c_str(), settings.size()) || mysql_set_character_set(raw, "utf8mb4"))
 			throw IOException("DDL session settings failed");
+		MySQLRenameDefinition definition;
+		string canonical_column, default_hex, default_charset;
+		bool string_default = false;
+		const auto target = KeywordHelper::WriteQuoted(d.intent.schema, '`') + "." +
+		                    KeywordHelper::WriteQuoted(d.intent.name, '`');
+		if (change_column) {
+			stage = "source_lock";
+			// 5.7 SHOW CREATE escapes backslashes even with NO_BACKSLASH_ESCAPES
+			// set. Match its output convention when executing the retained text.
+			ExecuteControl(raw, "SET SESSION autocommit=0,sql_quote_show_create=1,"
+			                    "sql_mode='STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,"
+			                    "ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'");
+			// Disable reconnect explicitly: losing this connection must never
+			// silently lose the lock and continue with a stale definition.
+			bool reconnect = false;
+			if (mysql_options(raw, MYSQL_OPT_RECONNECT, &reconnect)) {
+				throw IOException("DDL reconnect protection unavailable");
+			}
+			ExecuteControl(raw, "LOCK TABLES " + target + " WRITE");
+			stage = "source_definition";
+		}
 		if (ctx.IsInterrupted())
 			throw InterruptException();
 		if (d.intent.contract_version >= 3) {
-			auto literal = [&](const string &v) {
-				return "'" + StringUtil::Replace(v, "'", "''") + "'";
-			};
 			const string table = d.intent.action == "rename_index" ? d.intent.owner : d.intent.name;
-			const auto predicate = "TABLE_SCHEMA=" + literal(d.intent.schema) + " AND TABLE_NAME=" + literal(table);
+			const auto predicate = "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" + MetadataLiteral(table);
 			const bool present =
 			    Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE " + predicate) != "0";
 			if (present && (Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE " + predicate +
@@ -159,6 +294,50 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			}
 		}
 		auto native_sql = d.intent.sql;
+		if (change_column) {
+			canonical_column = ResolveColumn(raw, target, d.intent.column_name);
+			definition = MySQLRenameDefinition::Parse(ShowCreate(raw, target), d.intent.name);
+			auto execution_definition = definition;
+			const auto properties = Scalar(raw, "SELECT CONCAT(COALESCE(CHARACTER_SET_NAME,'binary'),':',DATA_TYPE,':',"
+			                                   "IF(COLUMN_DEFAULT IS NULL,'0','1'),':',IF(GENERATION_EXPRESSION='','0','1')) FROM information_schema.COLUMNS WHERE "
+			                                   "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" +
+			                                   MetadataLiteral(d.intent.name) + " AND BINARY COLUMN_NAME=BINARY " +
+			                                   MetadataLiteral(canonical_column));
+			auto parts = StringUtil::Split(properties, ':');
+			if (parts.size() != 4) {
+				throw std::invalid_argument("DDL source default metadata incomplete");
+			}
+			if (parts[3] == "1") {
+				// SHOW CREATE can replace each byte of a four-byte literal in
+				// a generated expression with '?'. I_S may truncate it instead,
+				// so neither text is an independent proof of that expression.
+				for (const auto &column : definition.columns) {
+					if (column.name == canonical_column && column.definition.find('?') != string::npos) {
+						throw std::invalid_argument("DDL source generated expression cannot be certified");
+					}
+				}
+			}
+			// 5.7 serializes ENUM/SET members through utf8mb3 as well. A '?'
+			// may be a literal member or a substituted four-byte character;
+			// neither SHOW nor I_S can distinguish them. Refuse before CHANGE.
+			if (parts[0] == "utf8mb4" && (parts[1] == "enum" || parts[1] == "set") &&
+			    Scalar(raw, "SELECT LOCATE('?',COLUMN_TYPE) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" +
+			                    MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" + MetadataLiteral(d.intent.name) +
+			                    " AND BINARY COLUMN_NAME=BINARY " + MetadataLiteral(canonical_column)) != "0") {
+				throw std::invalid_argument("DDL source enum members cannot be certified");
+			}
+			if (parts[2] == "1" && (parts[1] == "char" || parts[1] == "varchar" || parts[1] == "enum" ||
+			                        parts[1] == "set" || parts[1] == "binary" || parts[1] == "varbinary")) {
+				string_default = true;
+				default_charset = parts[0];
+				default_hex = DefaultHex(raw, d.intent.schema, d.intent.name, canonical_column, default_charset);
+				execution_definition.StringDefault(canonical_column, parts[0], default_hex);
+			}
+			native_sql = execution_definition.Change(d.intent.schema, d.intent.name, canonical_column, d.intent.new_name);
+			if (native_sql.size() > 65536) {
+				throw std::invalid_argument("DDL generated definition limit exceeded");
+			}
+		}
 		if (d.intent.action == "drop_constraint") {
 			auto literal = [](const string &v) {
 				return "'" + StringUtil::Replace(v, "'", "''") + "'";
@@ -182,6 +361,9 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			// native DROP CONSTRAINT form and retain the source's own error.
 		}
 		stage = "source_execute";
+		if (ctx.IsInterrupted()) {
+			throw InterruptException();
+		}
 		sent = true;
 		if (mysql_real_query(raw, native_sql.c_str(), native_sql.size())) {
             source.product="mysql"; source.state=mysql_sqlstate(raw); source.code=std::to_string(mysql_errno(raw)); source.message=mysql_error(raw);
@@ -203,11 +385,13 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			case 1050:
 			case 1051:
 			case 1061:
+			case 1060:
 			case 1091:
 			case 1142:
 			case 1146:
 			case 1217:
 			case 1451:
+			case 3108: // dependent generated column: rejected before changing the definition
 				status = "CONFIRMED_NOT_EXECUTED";
 				sent = false;
 				break;
@@ -223,19 +407,35 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		status = "COMMITTED";
 		warnings = mysql_warning_count(raw);
 		stage = warnings ? "source_warning" : "";
+		if (change_column && !warnings) {
+			stage = "source_verify";
+			auto after = MySQLRenameDefinition::Parse(ShowCreate(raw, target), d.intent.name);
+			if (!definition.Preserved(after, canonical_column, d.intent.new_name) ||
+			    (string_default && DefaultHex(raw, d.intent.schema, d.intent.name, d.intent.new_name, default_charset) != default_hex)) {
+				error = "XX000";
+				throw IOException("DDL committed column attributes differ from source definition");
+			}
+			stage.clear();
+		}
+	} catch (const std::invalid_argument &) {
+		// Parsing/size failures have no source errno; distinguish these from
+		// transport failures. A confirmed commit is never rewritten as unsent.
+		error = status == "COMMITTED" ? "XX000" : "0A000";
 	} catch (...) {
         if(source.message.empty() && pooled) {
             auto raw=pooled.GetConnection().GetConn();
             if(mysql_errno(raw)) {source.product="mysql";source.state=mysql_sqlstate(raw);source.code=std::to_string(mysql_errno(raw));source.message=mysql_error(raw);}
         }
 		if (error.empty())
-			error = ctx.IsInterrupted() ? "57014" : "08006";
+			error = ctx.IsInterrupted() ? "57014" : (!source.state.empty() ? source.state : "08006");
 		if (sent && status != "COMMITTED")
 			status = "UNKNOWN";
 	}
 	if (pooled) {
 		deadline.reset();
-		pooled.GetConnection().Close();
+		// Close releases table locks even after failure/cancellation; never
+		// return a lock-bearing session to the pool or retry its DDL.
+		pooled.Invalidate();
 	}
 	out.SetCardinality(1);
     if(d.diagnostics) out.SetValue(5,0,Value(source.JSON()));
