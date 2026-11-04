@@ -49,6 +49,28 @@ int main() {
 	renamed.columns.erase(renamed.columns.begin());
 	Require(!parsed.Preserved(renamed, "值`old", "新`列"));
 	Require(!parsed.Preserved(parsed, "absent", "new"));
+	const auto implicit = MySQLRenameDefinition::Parse(
+	    "CREATE TABLE `t` (`v` varchar(20) COMMENT 'DEFAULT NULL, kept', `other` int(11))", "t");
+	auto explicit_null = MySQLRenameDefinition::Parse(
+	    "CREATE TABLE `t` (`v2` varchar(20) DEFAULT NULL COMMENT 'DEFAULT NULL, kept', `other` int(11))", "t");
+	Require(!implicit.Preserved(explicit_null, "v", "v2"));
+	Require(implicit.Preserved(explicit_null, "v", "v2", true));
+	Require(explicit_null.Preserved(implicit, "v2", "v", true));
+	explicit_null.columns[1].definition += " DEFAULT NULL";
+	Require(!implicit.Preserved(explicit_null, "v", "v2", true)); // unrelated column stays strict
+	for (const auto &definition : {"varchar(20) NOT NULL COMMENT 'DEFAULT NULL, kept'",
+	                              "varchar(21) DEFAULT NULL COMMENT 'DEFAULT NULL, kept'",
+	                              "varchar(20) DEFAULT 'NULL' COMMENT 'DEFAULT NULL, kept'",
+	                              "varchar(20) DEFAULT NULL COMMENT 'changed'",
+	                              "varchar(20) DEFAULT 0 COMMENT 'DEFAULT NULL, kept'"}) {
+		auto changed = implicit;
+		changed.columns[0] = {"v2", definition};
+		Require(!implicit.Preserved(changed, "v", "v2", true));
+	}
+	Require(MySQLRenameDefinition::WithoutNullDefault("int GENERATED ALWAYS AS ((`DEFAULT NULL` + 1)) STORED") ==
+	        "int GENERATED ALWAYS AS ((`DEFAULT NULL` + 1)) STORED");
+	Require(MySQLRenameDefinition::WithoutNullDefault("enum('DEFAULT NULL','x') DEFAULT NULL") == "enum('DEFAULT NULL','x')");
+	Require(MySQLRenameDefinition::WithoutNullDefault("varchar(20) /* DEFAULT NULL */") == "varchar(20) /* DEFAULT NULL */");
 	const auto escaped = MySQLRenameDefinition::Parse(
 	    R"SQL(CREATE TABLE `t` (`x` varchar(50) DEFAULT 'a\'b\\c' COMMENT 'comma, \'quote\', \\backslash'))SQL", "t");
 	Require(escaped.columns.size() == 1);

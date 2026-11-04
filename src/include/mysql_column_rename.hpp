@@ -243,8 +243,53 @@ struct MySQLRenameDefinition {
 		}
 		Invalid();
 	}
+	// CHANGE may serialize an implicit nullable default as DEFAULT NULL. Only
+	// remove this top-level clause, never words inside a type, literal, comment
+	// or generated expression. The caller independently certifies nullable,
+	// non-generated, NULL-default semantics from the locked source definition.
+	static std::string WithoutNullDefault(const std::string &s) {
+		char quote = 0;
+		int depth = 0;
+		bool comment = false;
+		for (size_t p = 0; p < s.size(); p++) {
+			auto c = s[p];
+			if (comment) {
+				if (c == '*' && p + 1 < s.size() && s[p + 1] == '/') {
+					comment = false;
+					p++;
+				}
+			} else if (quote) {
+				if (c == '\\' && quote != '`') {
+					if (++p == s.size()) return s;
+				} else if (c == quote) {
+					if (p + 1 < s.size() && s[p + 1] == quote) p++;
+					else quote = 0;
+				}
+			} else if (c == '/' && p + 1 < s.size() && s[p + 1] == '*') {
+				comment = true;
+				p++;
+			} else if (c == '\'' || c == '"' || c == '`') {
+				quote = c;
+			} else if (c == '(') {
+				depth++;
+			} else if (c == ')') {
+				depth--;
+			} else if (!depth && (p == 0 || Space(s[p - 1])) && s.compare(p, 7, "DEFAULT") == 0 &&
+			           p + 7 < s.size() && Space(s[p + 7])) {
+				size_t first = p + 7;
+				SkipSpace(s, first);
+				if (s.compare(first, 4, "NULL") != 0 || (first + 4 < s.size() && !Space(s[first + 4]))) return s;
+				size_t start = p;
+				while (start > 0 && Space(s[start - 1])) start--;
+				size_t end = first + 4;
+				if (end == s.size()) return s.substr(0, start);
+				return s.substr(0, start) + s.substr(end);
+			}
+		}
+		return s;
+	}
 	bool Preserved(const MySQLRenameDefinition &after, const std::string &old_name,
-	               const std::string &new_name) const {
+	               const std::string &new_name, bool nullable_null_default = false) const {
 		if (columns.size() != after.columns.size()) {
 			return false;
 		}
@@ -253,7 +298,11 @@ struct MySQLRenameDefinition {
 			auto &before = columns[i];
 			auto &next = after.columns[i];
 			const bool target = before.name == old_name;
-			if (next.name != (target ? new_name : before.name) || next.definition != before.definition) {
+			if (next.name != (target ? new_name : before.name)) {
+				return false;
+			}
+			if (next.definition != before.definition &&
+			    !(target && nullable_null_default && WithoutNullDefault(next.definition) == WithoutNullDefault(before.definition))) {
 				return false;
 			}
 			renamed = renamed || target;

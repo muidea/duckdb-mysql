@@ -259,7 +259,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			throw IOException("DDL session settings failed");
 		MySQLRenameDefinition definition;
 		string canonical_column, default_hex, default_charset;
-		bool string_default = false;
+		bool string_default = false, nullable_null_default = false;
 		const auto target = KeywordHelper::WriteQuoted(d.intent.schema, '`') + "." +
 		                    KeywordHelper::WriteQuoted(d.intent.name, '`');
 		if (change_column) {
@@ -299,14 +299,15 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			definition = MySQLRenameDefinition::Parse(ShowCreate(raw, target), d.intent.name);
 			auto execution_definition = definition;
 			const auto properties = Scalar(raw, "SELECT CONCAT(COALESCE(CHARACTER_SET_NAME,'binary'),':',DATA_TYPE,':',"
-			                                   "IF(COLUMN_DEFAULT IS NULL,'0','1'),':',IF(GENERATION_EXPRESSION='','0','1')) FROM information_schema.COLUMNS WHERE "
+			                                   "IF(COLUMN_DEFAULT IS NULL,'0','1'),':',IF(GENERATION_EXPRESSION='','0','1'),':',IS_NULLABLE) FROM information_schema.COLUMNS WHERE "
 			                                   "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" +
 			                                   MetadataLiteral(d.intent.name) + " AND BINARY COLUMN_NAME=BINARY " +
 			                                   MetadataLiteral(canonical_column));
 			auto parts = StringUtil::Split(properties, ':');
-			if (parts.size() != 4) {
+			if (parts.size() != 5) {
 				throw std::invalid_argument("DDL source default metadata incomplete");
 			}
+			nullable_null_default = parts[2] == "0" && parts[3] == "0" && parts[4] == "YES";
 			if (parts[3] == "1") {
 				// SHOW CREATE can replace each byte of a four-byte literal in
 				// a generated expression with '?'. I_S may truncate it instead,
@@ -410,7 +411,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		if (change_column && !warnings) {
 			stage = "source_verify";
 			auto after = MySQLRenameDefinition::Parse(ShowCreate(raw, target), d.intent.name);
-			if (!definition.Preserved(after, canonical_column, d.intent.new_name) ||
+			if (!definition.Preserved(after, canonical_column, d.intent.new_name, nullable_null_default) ||
 			    (string_default && DefaultHex(raw, d.intent.schema, d.intent.name, d.intent.new_name, default_charset) != default_hex)) {
 				error = "XX000";
 				throw IOException("DDL committed column attributes differ from source definition");
