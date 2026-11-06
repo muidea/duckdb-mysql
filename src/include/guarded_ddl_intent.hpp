@@ -15,6 +15,38 @@ struct GuardedDDLIntent {
 	    reference_schema, reference_table, identity_mode;
 	vector<string> constraint_keys, reference_keys;
 	static GuardedDDLIntent BindV4(const vector<Value> &input, bool mysql);
+	static string ColumnTypeV5(const string &type, int32_t length, int32_t precision, int32_t scale, bool mysql) {
+		if (type == "numeric") {
+			if (length || precision < 1 || precision > (mysql ? 65 : 38) || scale < 0 || scale > precision ||
+			    (mysql && scale > 30))
+				throw BinderException("DDL numeric precision/scale is unsupported");
+			return "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
+		}
+		if (type == "timestamp" || type == "time") {
+			if (length || precision < 0 || precision > 6 || scale || (mysql && type == "time"))
+				throw BinderException("DDL temporal precision is unsupported");
+			return string(mysql            ? "DATETIME("
+			              : type == "time" ? "TIME("
+			                               : "TIMESTAMP(") +
+			       std::to_string(precision) + ")" + (mysql ? "" : " WITHOUT TIME ZONE");
+		}
+		if (precision || scale)
+			throw BinderException("DDL unexpected type modifiers");
+		if (type == "varchar" && length >= 1 && length <= (mysql ? 16383 : 10485760))
+			return "VARCHAR(" + std::to_string(length) + ")";
+		if (length)
+			throw BinderException("DDL unexpected length");
+		if (type == "smallint" || type == "integer" || type == "bigint" || type == "text" || type == "date")
+			return type;
+		if (type == "real")
+			return mysql ? "FLOAT" : "REAL";
+		if (type == "double")
+			return mysql ? "DOUBLE" : "DOUBLE PRECISION";
+		if (!mysql && (type == "boolean" || type == "uuid" || type == "bytea"))
+			return type;
+		throw BinderException("DDL column type is unsupported");
+	}
+
 	static bool Name(const string &s) {
 		return !s.empty() && s.size() <= 63 && s.find('\0') == string::npos;
 	}
@@ -49,7 +81,7 @@ struct GuardedDDLIntent {
 		const auto &types = StructType::GetChildTypes(v.type());
 		const auto &fields = StructValue::GetChildren(v);
 		vector<string> names = {"contract_version", "target_contract", "action", "name", "index_name", "owner"};
-		if (contract == 3) {
+		if (contract == 3 || contract == 5) {
 			names.push_back("new_name");
 			names.push_back("column_name");
 		}
@@ -69,8 +101,8 @@ struct GuardedDDLIntent {
 		d.owner = Text(fields[5]);
 		if (!Name(d.name) || (!d.index.empty() && !Name(d.index)) || (!d.owner.empty() && !Name(d.owner)))
 			throw BinderException("DDL target name is invalid");
-		const idx_t offset = contract == 3 ? 2 : 0;
-		if (contract == 3) {
+		const idx_t offset = contract == 3 || contract == 5 ? 2 : 0;
+		if (contract == 3 || contract == 5) {
 			d.new_name = Text(fields[6]);
 			d.column_name = Text(fields[7]);
 			if ((!d.new_name.empty() && !Name(d.new_name)) || (!d.column_name.empty() && !Name(d.column_name)))
@@ -78,7 +110,8 @@ struct GuardedDDLIntent {
 		}
 		const bool extended_action = d.action == "rename_table" || d.action == "add_column" ||
 		                             d.action == "rename_column" || d.action == "rename_index";
-		if (extended_action != (contract == 3))
+		if (contract == 5 ? (d.action != "create_table" && d.action != "add_column")
+		                  : extended_action != (contract == 3))
 			throw BinderException("DDL action requires a different contract");
 		if (fields[6 + offset].type().id() != LogicalTypeId::LIST ||
 		    fields[7 + offset].type().id() != LogicalTypeId::LIST)
@@ -96,8 +129,8 @@ struct GuardedDDLIntent {
 				throw BinderException("DDL column definition is invalid");
 			const auto &ct = StructType::GetChildTypes(col.type());
 			const auto &cv = StructValue::GetChildren(col);
-			if (ct.size() != 3 || ct[0].first != "name" || ct[1].first != "type" || ct[2].first != "length" ||
-			    cv[2].IsNull() || cv[2].type().id() != LogicalTypeId::INTEGER)
+			if (ct.size() != (contract == 5 ? 5 : 3) || ct[0].first != "name" || ct[1].first != "type" ||
+			    ct[2].first != "length" || cv[2].IsNull() || cv[2].type().id() != LogicalTypeId::INTEGER)
 				throw BinderException("DDL column fields are invalid");
 			string n = Text(cv[0]), type = Text(cv[1]);
 			if (!Name(n) || std::find(seen.begin(), seen.end(), n) != seen.end())
@@ -105,7 +138,12 @@ struct GuardedDDLIntent {
 			seen.push_back(n);
 			auto length = cv[2].GetValue<int32_t>();
 			string native;
-			if (type == "smallint" || type == "integer" || type == "bigint") {
+			if (contract == 5) {
+				if (ct[3].first != "precision" || ct[4].first != "scale" || cv[3].IsNull() || cv[4].IsNull() ||
+				    cv[3].type().id() != LogicalTypeId::INTEGER || cv[4].type().id() != LogicalTypeId::INTEGER)
+					throw BinderException("DDL numeric/time modifiers are invalid");
+				native = ColumnTypeV5(type, length, cv[3].GetValue<int32_t>(), cv[4].GetValue<int32_t>(), mysql);
+			} else if (type == "smallint" || type == "integer" || type == "bigint") {
 				if (length)
 					throw BinderException("DDL column length is invalid");
 				native = type;
@@ -126,7 +164,8 @@ struct GuardedDDLIntent {
 		}
 		const auto target = quote(d.schema) + "." + quote(d.name);
 		if (d.action == "create_table") {
-			if (d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty())
+			if (d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() || !d.new_name.empty() ||
+			    !d.column_name.empty())
 				throw BinderException("DDL create table options are invalid");
 			d.sql = "CREATE TABLE " + target + " (" + StringUtil::Join(d.columns, ",") + ")";
 			if (mysql)

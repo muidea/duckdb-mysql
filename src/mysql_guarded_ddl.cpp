@@ -49,6 +49,10 @@ static unique_ptr<FunctionData> BindV4(ClientContext &ctx, TableFunctionBindInpu
                                        vector<string> &names) {
 	return BindContract(ctx, in, types, names, 4);
 }
+static unique_ptr<FunctionData> BindV5(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
+                                       vector<string> &names) {
+	return BindContract(ctx, in, types, names, 5);
+}
 static string Scalar(MYSQL *raw, const string &sql) {
 	if (mysql_real_query(raw, sql.c_str(), sql.size()))
 		throw IOException("DDL identity query failed");
@@ -449,6 +453,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 } // namespace
 void RegisterMySQLGuardedDDL(ExtensionLoader &loader) {
   auto register_function = [&](TableFunction function) {function.named_parameters["source_diagnostics"]=LogicalType::BOOLEAN;loader.RegisterFunction(function);};
+  register_function(TableFunction(
+	  "mysql_guarded_ddl_v5",
+	  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}, Scan,
+	  BindV5, Init));
 	register_function(TableFunction(
 	    "mysql_guarded_ddl_v2",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
