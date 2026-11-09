@@ -1,3 +1,4 @@
+#include "mysql_source_error.hpp"
 #include "mysql_result.hpp"
 
 #include "duckdb/common/types/datetime.hpp"
@@ -74,8 +75,7 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
 
 	int res_bind = mysql_stmt_bind_result(stmt.get(), binds.data());
 	if (res_bind != 0) {
-		throw IOException("Failed to bind result set for MySQL query \"%s\": %s\n", query.c_str(),
-		                  mysql_stmt_error(stmt.get()));
+		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt.get(), "source_bind", query));
 	}
 
 	auto ltypes = CreateChunkTypes(fields, type_config);
@@ -109,8 +109,7 @@ void MySQLResult::HandleTruncatedData() {
 		int res_fetch = mysql_stmt_fetch_column(stmt.get(), &b, static_cast<unsigned int>(i),
 		                                        static_cast<unsigned long>(f.bind_buffer.size()));
 		if (res_fetch != 0) {
-			throw IOException("Failed to re-fetch result field \"%s\" for MySQL query \"%s\": %s\n", f.name.c_str(),
-			                  query.c_str(), mysql_stmt_error(stmt.get()));
+			throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt.get(), "source_fetch", query));
 		}
 	}
 }
@@ -148,8 +147,7 @@ bool MySQLResult::FetchNext() {
 	int res = mysql_stmt_fetch(stmt.get());
 
 	if (res == 1) {
-		throw IOException("Failed to fetch result row for MySQL query \"%s\": %s\n", query.c_str(),
-		                  mysql_stmt_error(stmt.get()));
+		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt.get(), "source_fetch", query));
 	}
 
 	HandleTruncatedData();
@@ -252,7 +250,7 @@ const vector<MySQLField> &MySQLResult::Fields() {
 }
 
 MySQLTextResult::MySQLTextResult(const std::string &query_p, MySQLResultPtr result_p, idx_t affected_rows_p,
-                               const MySQLTypeConfig &type_config_p)
+                                 const MySQLTypeConfig &type_config_p)
     : query(query_p), result(std::move(result_p)), type_config(type_config_p), affected_rows(affected_rows_p) {
 	if (!result) {
 		vector<LogicalType> empty_types;
@@ -340,8 +338,8 @@ DataChunk &MySQLTextResult::NextChunk() {
 				FlatVector::SetNull(vec, r, true);
 				continue;
 			}
-			auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type,
-			                                         row[c], lengths[c]);
+			auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type, row[c],
+			                                         lengths[c]);
 			data_chunk.SetValue(c, r, value);
 		}
 	}

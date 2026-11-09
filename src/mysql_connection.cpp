@@ -1,3 +1,4 @@
+#include "mysql_source_error.hpp"
 #include "mysql_connection.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
@@ -54,9 +55,12 @@ idx_t MySQLConnection::MySQLExecute(MYSQL_STMT *stmt, const string &query, const
 		auto con = GetConn();
 		int res_query = mysql_real_query(con, query.c_str(), query.size());
 		if (res_query != 0) {
-			throw IOException("Failed to run query \"%s\": %s\n", query.c_str(), mysql_error(con));
+			throw IOException("%s", MySQLQueryErrorMessage(con, nullptr, "source_execute", query));
 		}
 		auto result = MySQLResultPtr(mysql_store_result(con), MySQLResultDelete);
+		if (!result && mysql_errno(con)) {
+			throw IOException("%s", MySQLQueryErrorMessage(con, nullptr, "source_result", query));
+		}
 		return 0;
 	}
 
@@ -65,7 +69,7 @@ idx_t MySQLConnection::MySQLExecute(MYSQL_STMT *stmt, const string &query, const
 	if (!prepared) {
 		int res_prepare = mysql_stmt_prepare(stmt, query.c_str(), query.size());
 		if (res_prepare != 0) {
-			throw IOException("Failed to prepare MySQL query \"%s\": %s\n", query.c_str(), mysql_stmt_error(stmt));
+			throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_prepare", query));
 		}
 	}
 
@@ -86,14 +90,13 @@ idx_t MySQLConnection::MySQLExecute(MYSQL_STMT *stmt, const string &query, const
 		}
 		auto res_bind = mysql_stmt_bind_param(stmt, binds.data());
 		if (res_bind != 0) {
-			throw IOException("Failed to bind parameters, count: %zu, MySQL query \"%s\": %s\n", binds.size(),
-			                  query.c_str(), mysql_stmt_error(stmt));
+			throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_bind", query));
 		}
 	}
 
 	int res_exec = mysql_stmt_execute(stmt);
 	if (res_exec != 0) {
-		throw IOException("Failed to execute MySQL query \"%s\": %s\n", query.c_str(), mysql_stmt_error(stmt));
+		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_execute", query));
 	}
 
 	idx_t affected_rows = mysql_stmt_affected_rows(stmt);
@@ -102,14 +105,12 @@ idx_t MySQLConnection::MySQLExecute(MYSQL_STMT *stmt, const string &query, const
 		bool btrue = true;
 		auto res_attr = mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &btrue);
 		if (res_attr != 0) {
-			throw IOException("Failed to set STMT_ATTR_UPDATE_MAX_LENGTH for MySQL query \"%s\": %s\n", query.c_str(),
-			                  mysql_stmt_error(stmt));
+			throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_result", query));
 		}
 
 		int res_store = mysql_stmt_store_result(stmt);
 		if (res_store != 0) {
-			throw IOException("Failed to store result for MySQL query \"%s\": %s\n", query.c_str(),
-			                  mysql_stmt_error(stmt));
+			throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_result", query));
 		}
 	}
 
@@ -130,7 +131,7 @@ unique_ptr<MySQLResult> MySQLConnection::QueryInternal(const string &query, cons
 
 	auto stmt = MySQLStatementPtr(mysql_stmt_init(con), MySQLStatementDelete);
 	if (!stmt) {
-		throw IOException("Failed to initialize MySQL query \"%s\": %s\n", query.c_str(), mysql_error(con));
+		throw IOException("%s", MySQLQueryErrorMessage(con, nullptr, "source_prepare", query));
 	}
 	idx_t affected_rows = MySQLExecute(stmt.get(), query, params, result_streaming);
 	unsigned long connection_id = connection->GetID();
@@ -156,10 +157,13 @@ unique_ptr<MySQLTextResult> MySQLConnection::QueryText(const string &query) {
 	auto con = GetConn();
 	int res_query = mysql_real_query(con, query.c_str(), query.size());
 	if (res_query != 0) {
-		throw IOException("Failed to run text protocol MySQL query \"%s\": %s\n", query.c_str(), mysql_error(con));
+		throw IOException("%s", MySQLQueryErrorMessage(con, nullptr, "source_execute", query));
 	}
 
 	auto result = MySQLResultPtr(mysql_store_result(con), MySQLResultDelete);
+	if (!result && mysql_errno(con)) {
+		throw IOException("%s", MySQLQueryErrorMessage(con, nullptr, "source_result", query));
+	}
 	auto affected_rows = mysql_affected_rows(con);
 	return make_uniq<MySQLTextResult>(query, std::move(result), affected_rows, type_config);
 }
@@ -181,12 +185,12 @@ unique_ptr<MySQLStatement> MySQLConnection::Prepare(const string &query) {
 
 	auto stmt = MySQLStatementPtr(mysql_stmt_init(con), MySQLStatementDelete);
 	if (!stmt) {
-		throw IOException("Failed to initialize MySQL query \"%s\": %s\n", query.c_str(), mysql_error(con));
+		throw IOException("%s", MySQLQueryErrorMessage(con, nullptr, "source_prepare", query));
 	}
 
 	int res_prepare = mysql_stmt_prepare(stmt.get(), query.c_str(), query.size());
 	if (res_prepare != 0) {
-		throw IOException("Failed to prepare MySQL query \"%s\": %s\n", query.c_str(), mysql_stmt_error(stmt.get()));
+		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt.get(), "source_prepare", query));
 	}
 
 	vector<MySQLField> fields = MySQLField::ReadFields(query, stmt.get(), type_config);
@@ -258,7 +262,8 @@ MySQLBackendCapabilities MySQLConnection::DetectBackendCapabilities() {
 	bool starrocks_version_text = IsStarRocksVersion(caps.version) || IsStarRocksVersion(caps.version_comment) ||
 	                              IsStarRocksVersion(current_version);
 	if (starrocks_version_text || starrocks_show_frontends || starrocks_port_hint) {
-		auto starrocks_major = !current_version.empty() ? ParseMajorVersion(current_version) : ParseMajorVersion(caps.version);
+		auto starrocks_major =
+		    !current_version.empty() ? ParseMajorVersion(current_version) : ParseMajorVersion(caps.version);
 		if (starrocks_port_hint || starrocks_show_frontends || (starrocks_major >= 0 && starrocks_major < 3)) {
 			caps.kind = MySQLBackendKind::STARROCKS_LEGACY;
 			caps.supports_prepared_statement = false;

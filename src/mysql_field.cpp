@@ -1,3 +1,4 @@
+#include "mysql_source_error.hpp"
 #include "mysql_result.hpp"
 
 namespace duckdb {
@@ -64,14 +65,12 @@ vector<MySQLField> MySQLField::ReadFields(const std::string &query, MYSQL_STMT *
 
 	auto rsmd = MySQLResultPtr(mysql_stmt_result_metadata(stmt), MySQLResultDelete);
 	if (!rsmd) {
-		throw IOException("Failed to fetch result metadata for MySQL query \"%s\": %s\n", query.c_str(),
-		                  mysql_stmt_error(stmt));
+		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_describe", query));
 	}
 
 	MYSQL_FIELD *mfields = mysql_fetch_fields(rsmd.get());
 	if (!mfields) {
-		throw IOException("Failed to fetch result fields for MySQL query \"%s\": %s\n", query.c_str(),
-		                  mysql_stmt_error(stmt));
+		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt, "source_describe", query));
 	}
 	fields.reserve(field_count);
 	for (size_t i = 0; i < field_count; i++) {

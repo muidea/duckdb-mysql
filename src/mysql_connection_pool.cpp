@@ -1,3 +1,4 @@
+#include "mysql_source_error.hpp"
 #include "mysql_connection_pool.hpp"
 
 #include <chrono>
@@ -54,20 +55,20 @@ void MySQLConnectionPool::ResetConnection(MySQLConnection &conn) {
 
 #if defined(MARIADB_VERSION_ID) || (defined(MYSQL_VERSION_ID) && MYSQL_VERSION_ID >= 50703)
 	if (mysql_reset_connection(mysql_conn) != 0) {
-		throw IOException("Failed to reset MySQL connection: %s", mysql_error(mysql_conn));
+		throw IOException("%s", MySQLQueryErrorMessage(mysql_conn, nullptr, "source_connect"));
 	}
 #else
 	if (mysql_change_user(mysql_conn, nullptr, nullptr, nullptr) != 0) {
-		throw IOException("Failed to reset MySQL connection: %s", mysql_error(mysql_conn));
+		throw IOException("%s", MySQLQueryErrorMessage(mysql_conn, nullptr, "source_connect"));
 	}
 #endif
 
 	if (mysql_query(mysql_conn, "SET autocommit=1") != 0) {
-		throw IOException("Failed to set autocommit after connection reset: %s", mysql_error(mysql_conn));
+		throw IOException("%s", MySQLQueryErrorMessage(mysql_conn, nullptr, "source_connect"));
 	}
 
 	if (mysql_set_character_set(mysql_conn, "utf8mb4") != 0) {
-		throw IOException("Failed to set character set after connection reset: %s", mysql_error(mysql_conn));
+		throw IOException("%s", MySQLQueryErrorMessage(mysql_conn, nullptr, "source_connect"));
 	}
 
 	const char *charset = mysql_character_set_name(mysql_conn);
