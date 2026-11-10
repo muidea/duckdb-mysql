@@ -59,6 +59,23 @@ int main() {
 	Require(decode(LogicalType::DATE, "0000-00-00", MYSQL_TYPE_DATE).IsNull());
 	Require(decode(LogicalType::TIMESTAMP, "2026-10-29 01:02:03.123456", MYSQL_TYPE_DATETIME).ToString() ==
 	        "2026-10-29 01:02:03.123456");
+	for (const auto &text : {"1", "true", "TRUE", "True"}) {
+		Require(decode(LogicalType::BOOLEAN, text).GetValue<bool>());
+	}
+	for (const auto &text : {"0", "false", "FALSE", "False"}) {
+		Require(!decode(LogicalType::BOOLEAN, text).GetValue<bool>());
+	}
+	for (const auto &text : {"-128", "-1", "2", "127", "128", "255", "+1"}) {
+		Require(decode(LogicalType::BOOLEAN, text, MYSQL_TYPE_TINY).GetValue<bool>());
+	}
+	Require(!decode(LogicalType::BOOLEAN, "-0", MYSQL_TYPE_TINY).GetValue<bool>());
+	Require(MySQLTypes::DecodeTextValue(config, LogicalType::BOOLEAN, MYSQL_TYPE_TINY, nullptr, 0).IsNull());
+	for (const auto &text : {"", "1suffix", "1.0", "yes", "256", "-129"}) {
+		bool rejected = false;
+		try { decode(LogicalType::BOOLEAN, text, MYSQL_TYPE_TINY); }
+		catch (const Exception &) { rejected = true; }
+		Require(rejected);
+	}
 	Require(decode(LogicalType::BOOLEAN, string(1, '\1'), MYSQL_TYPE_BIT).GetValue<bool>());
 	Require(!decode(LogicalType::BOOLEAN, string(1, '\0'), MYSQL_TYPE_BIT).GetValue<bool>());
 	Require(decode(LogicalType::TIMESTAMP, "0000-00-00 00:00:00.000000", MYSQL_TYPE_DATETIME).IsNull());

@@ -18,6 +18,31 @@ Value MySQLTypes::DecodeTextValue(const MySQLTypeConfig &config, const LogicalTy
 		}
 		return Value::BOOLEAN(data[0] != 0);
 	}
+	if (type.id() == LogicalTypeId::BOOLEAN) {
+		if (mysql_type == MYSQL_TYPE_TINY) {
+			// TINYINT(1) is a display width, not a 0/1 constraint. Match
+			// the prepared-result path's nonzero boolean semantics.
+			idx_t start = !text.empty() && (text[0] == '-' || text[0] == '+') ? 1 : 0;
+			if (start < text.size() && text.find_first_not_of("0123456789", start) == string::npos) {
+				unsigned magnitude = 0;
+				unsigned maximum = text[0] == '-' ? 128 : 255;
+				for (idx_t pos = start; pos < text.size(); pos++) {
+					magnitude = magnitude * 10 + unsigned(text[pos] - '0');
+					if (magnitude > maximum) {
+						throw ConversionException("MySQL boolean TINYINT value is out of range");
+					}
+				}
+				return Value::BOOLEAN(magnitude != 0);
+			}
+		}
+		if (text == "1" || StringUtil::CIEquals(text, "true")) {
+			return Value::BOOLEAN(true);
+		}
+		if (text == "0" || StringUtil::CIEquals(text, "false")) {
+			return Value::BOOLEAN(false);
+		}
+		throw ConversionException("Invalid MySQL boolean text-protocol value");
+	}
 	if (type.id() == LogicalTypeId::DATE || type.id() == LogicalTypeId::TIMESTAMP) {
 		bool zero = text == "0000-00-00" || text == "0000-00-00 00:00:00" ||
 		            (text.size() > 20 && text.substr(0, 20) == "0000-00-00 00:00:00." &&

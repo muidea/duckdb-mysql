@@ -42,7 +42,8 @@ class MySQLResult : public MySQLResultReader {
 public:
 	MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
 	            const string &connection_string_p, unsigned long connection_id_p, MySQLResultStreaming streaming_p,
-	            idx_t affected_rows_p, vector<MySQLField> fields_p = vector<MySQLField>());
+	            idx_t affected_rows_p, vector<MySQLField> fields_p = vector<MySQLField>(),
+	            shared_ptr<OwnedMySQLConnection> source_connection_p = nullptr);
 
 	~MySQLResult() override;
 
@@ -58,6 +59,8 @@ public:
 	const vector<MySQLField> &Fields() override;
 
 private:
+	// Keep the diagnostic handle alive until the statement/result is destroyed.
+	shared_ptr<OwnedMySQLConnection> source_connection;
 	string query;
 	MySQLStatementPtr stmt;
 	MySQLTypeConfig type_config;

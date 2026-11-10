@@ -136,7 +136,7 @@ unique_ptr<MySQLResult> MySQLConnection::QueryInternal(const string &query, cons
 	idx_t affected_rows = MySQLExecute(stmt.get(), query, params, result_streaming);
 	unsigned long connection_id = connection->GetID();
 	return make_uniq<MySQLResult>(query, std::move(stmt), type_config, connection_string, connection_id, streaming,
-	                              affected_rows);
+	                              affected_rows, vector<MySQLField>(), connection);
 }
 
 unique_ptr<MySQLResult> MySQLConnection::Query(const string &query, MySQLResultStreaming streaming) {
@@ -177,7 +177,7 @@ unique_ptr<MySQLResult> MySQLConnection::Query(MySQLStatement &stmt, const vecto
 	auto stmt_ptr = stmt.release();
 	unsigned long connection_id = connection->GetID();
 	return make_uniq<MySQLResult>(stmt.Query(), std::move(stmt_ptr), type_config, connection_string, connection_id,
-	                              streaming, affected_rows, stmt.FieldsCopy());
+	                              streaming, affected_rows, stmt.FieldsCopy(), connection);
 }
 
 unique_ptr<MySQLStatement> MySQLConnection::Prepare(const string &query) {

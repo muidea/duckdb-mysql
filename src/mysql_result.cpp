@@ -1,4 +1,6 @@
 #include "mysql_source_error.hpp"
+#include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "mysql_result.hpp"
 
 #include "duckdb/common/types/datetime.hpp"
@@ -55,8 +57,9 @@ static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const My
 
 MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
                          const string &connection_string_p, unsigned long connection_id_p,
-                         MySQLResultStreaming streaming_p, idx_t affected_rows_p, vector<MySQLField> fields_p)
-    : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)),
+                         MySQLResultStreaming streaming_p, idx_t affected_rows_p, vector<MySQLField> fields_p,
+                         shared_ptr<OwnedMySQLConnection> source_connection_p)
+    : source_connection(std::move(source_connection_p)), query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)),
       connection_string(connection_string_p), connection_id(connection_id_p), streaming(streaming_p),
       affected_rows(affected_rows_p), fields(std::move(fields_p)) {
 	if (affected_rows != static_cast<idx_t>(-1)) {
@@ -109,7 +112,7 @@ void MySQLResult::HandleTruncatedData() {
 		int res_fetch = mysql_stmt_fetch_column(stmt.get(), &b, static_cast<unsigned int>(i),
 		                                        static_cast<unsigned long>(f.bind_buffer.size()));
 		if (res_fetch != 0) {
-			throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt.get(), "source_fetch", query));
+			throw IOException("%s", MySQLQueryErrorMessage(source_connection ? source_connection->connection : nullptr, stmt.get(), "source_fetch", query));
 		}
 	}
 }
@@ -147,7 +150,11 @@ bool MySQLResult::FetchNext() {
 	int res = mysql_stmt_fetch(stmt.get());
 
 	if (res == 1) {
-		throw IOException("%s", MySQLQueryErrorMessage(nullptr, stmt.get(), "source_fetch", query));
+		auto diagnostic = MySQLQueryErrorMessage(source_connection ? source_connection->connection : nullptr,
+		                                        stmt.get(), "source_fetch", query);
+		fprintf(stderr, "FQE_MYSQL_FETCH_FAILURE rc=%d streaming=%d connection_id=%lu diagnostic=%s\n",
+		        res, int(streaming), connection_id, diagnostic.c_str());
+		throw IOException("%s", diagnostic);
 	}
 
 	HandleTruncatedData();
@@ -338,9 +345,21 @@ DataChunk &MySQLTextResult::NextChunk() {
 				FlatVector::SetNull(vec, r, true);
 				continue;
 			}
-			auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type, row[c],
-			                                         lengths[c]);
-			data_chunk.SetValue(c, r, value);
+			try {
+				auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type, row[c],
+				                                         lengths[c]);
+				data_chunk.SetValue(c, r, value);
+			} catch (const std::exception &error) {
+				ErrorData original(error);
+				if (original.Type() != ExceptionType::CONVERSION && original.Type() != ExceptionType::INVALID_INPUT &&
+				    original.Type() != ExceptionType::OUT_OF_RANGE) {
+					throw;
+				}
+				throw ConversionException("MySQL text result decode failed: column=%s target_type=%s "
+				                          "mysql_type=%d stage=result_decode query=%s: %s",
+				                          fields[c].name, fields[c].duckdb_type.ToString(), int(fields[c].mysql_type),
+				                          query, error.what());
+			}
 		}
 	}
 
