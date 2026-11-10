@@ -59,9 +59,9 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
                          const string &connection_string_p, unsigned long connection_id_p,
                          MySQLResultStreaming streaming_p, idx_t affected_rows_p, vector<MySQLField> fields_p,
                          shared_ptr<OwnedMySQLConnection> source_connection_p)
-    : source_connection(std::move(source_connection_p)), query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)),
-      connection_string(connection_string_p), connection_id(connection_id_p), streaming(streaming_p),
-      affected_rows(affected_rows_p), fields(std::move(fields_p)) {
+    : source_connection(std::move(source_connection_p)), query(query_p), stmt(std::move(stmt_p)),
+      type_config(std::move(type_config_p)), connection_string(connection_string_p), connection_id(connection_id_p),
+      streaming(streaming_p), affected_rows(affected_rows_p), fields(std::move(fields_p)) {
 	if (affected_rows != static_cast<idx_t>(-1)) {
 		return;
 	}
@@ -112,7 +112,8 @@ void MySQLResult::HandleTruncatedData() {
 		int res_fetch = mysql_stmt_fetch_column(stmt.get(), &b, static_cast<unsigned int>(i),
 		                                        static_cast<unsigned long>(f.bind_buffer.size()));
 		if (res_fetch != 0) {
-			throw IOException("%s", MySQLQueryErrorMessage(source_connection ? source_connection->connection : nullptr, stmt.get(), "source_fetch", query));
+			throw IOException("%s", MySQLQueryErrorMessage(source_connection ? source_connection->connection : nullptr,
+			                                               stmt.get(), "source_fetch", query));
 		}
 	}
 }
@@ -151,9 +152,9 @@ bool MySQLResult::FetchNext() {
 
 	if (res == 1) {
 		auto diagnostic = MySQLQueryErrorMessage(source_connection ? source_connection->connection : nullptr,
-		                                        stmt.get(), "source_fetch", query);
-		fprintf(stderr, "FQE_MYSQL_FETCH_FAILURE rc=%d streaming=%d connection_id=%lu diagnostic=%s\n",
-		        res, int(streaming), connection_id, diagnostic.c_str());
+		                                         stmt.get(), "source_fetch", query);
+		fprintf(stderr, "FQE_MYSQL_FETCH_FAILURE rc=%d streaming=%d connection_id=%lu diagnostic=%s\n", res,
+		        int(streaming), connection_id, diagnostic.c_str());
 		throw IOException("%s", diagnostic);
 	}
 
@@ -346,19 +347,16 @@ DataChunk &MySQLTextResult::NextChunk() {
 				continue;
 			}
 			try {
-				auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type, row[c],
-				                                         lengths[c]);
+				auto value = MySQLTypes::DecodeTextValue(type_config, fields[c].duckdb_type, fields[c].mysql_type,
+				                                         row[c], lengths[c]);
 				data_chunk.SetValue(c, r, value);
 			} catch (const std::exception &error) {
-				ErrorData original(error);
-				if (original.Type() != ExceptionType::CONVERSION && original.Type() != ExceptionType::INVALID_INPUT &&
-				    original.Type() != ExceptionType::OUT_OF_RANGE) {
+				auto diagnostic =
+				    QueryResultErrorMessage(error, "mysql", query, fields[c].name, fields[c].duckdb_type.ToString());
+				if (diagnostic.empty()) {
 					throw;
 				}
-				throw ConversionException("MySQL text result decode failed: column=%s target_type=%s "
-				                          "mysql_type=%d stage=result_decode query=%s: %s",
-				                          fields[c].name, fields[c].duckdb_type.ToString(), int(fields[c].mysql_type),
-				                          query, error.what());
+				throw IOException("%s", diagnostic);
 			}
 		}
 	}
@@ -537,65 +535,73 @@ void MySQLResult::WriteToChunk(idx_t row) {
 			continue;
 		}
 
-		switch (vec.GetType().id()) {
-		case LogicalTypeId::BOOLEAN: {
-			WriteBool(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::TINYINT: {
-			WriteNumber<int8_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::UTINYINT: {
-			WriteNumber<uint8_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::SMALLINT: {
-			WriteNumber<int16_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::USMALLINT: {
-			WriteNumber<uint16_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			WriteNumber<int32_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::UINTEGER: {
-			WriteNumber<uint32_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::BIGINT: {
-			WriteNumber<int64_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::UBIGINT: {
-			WriteNumber<uint64_t>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::FLOAT: {
-			WriteNumber<float>(f, vec, row);
-			break;
-		}
-		case LogicalTypeId::DOUBLE: {
-			if (f.mysql_type == MYSQL_TYPE_DOUBLE) {
-				WriteNumber<double>(f, vec, row);
-			} else {
+		try {
+			switch (vec.GetType().id()) {
+			case LogicalTypeId::BOOLEAN: {
+				WriteBool(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::TINYINT: {
+				WriteNumber<int8_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UTINYINT: {
+				WriteNumber<uint8_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::SMALLINT: {
+				WriteNumber<int16_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::USMALLINT: {
+				WriteNumber<uint16_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::INTEGER: {
+				WriteNumber<int32_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UINTEGER: {
+				WriteNumber<uint32_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::BIGINT: {
+				WriteNumber<int64_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::UBIGINT: {
+				WriteNumber<uint64_t>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::FLOAT: {
+				WriteNumber<float>(f, vec, row);
+				break;
+			}
+			case LogicalTypeId::DOUBLE: {
+				if (f.mysql_type == MYSQL_TYPE_DOUBLE) {
+					WriteNumber<double>(f, vec, row);
+				} else {
+					WriteString(f, vec, row);
+				}
+				break;
+			}
+			case LogicalTypeId::DATE:
+			case LogicalTypeId::TIME:
+			case LogicalTypeId::TIMESTAMP:
+			case LogicalTypeId::TIMESTAMP_TZ: {
+				WriteDateTime(type_config, f, vec, row);
+				break;
+			}
+			default: {
 				WriteString(f, vec, row);
 			}
-			break;
-		}
-		case LogicalTypeId::DATE:
-		case LogicalTypeId::TIME:
-		case LogicalTypeId::TIMESTAMP:
-		case LogicalTypeId::TIMESTAMP_TZ: {
-			WriteDateTime(type_config, f, vec, row);
-			break;
-		}
-		default: {
-			WriteString(f, vec, row);
-		}
+			}
+		} catch (const std::exception &error) {
+			auto diagnostic = QueryResultErrorMessage(error, "mysql", query, f.name, vec.GetType().ToString());
+			if (diagnostic.empty()) {
+				throw;
+			}
+			throw IOException("%s", diagnostic);
 		}
 	}
 }

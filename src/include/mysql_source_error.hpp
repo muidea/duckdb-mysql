@@ -26,16 +26,16 @@ inline string MySQLQueryErrorMessage(MYSQL *connection, MYSQL_STMT *statement, c
 	if (e.state.empty() || e.state == "00000") {
 		// Preserve evidence even when the client library supplies no SQLSTATE.
 		// Do not manufacture a source state from the message or a fetch code.
-		e.message += "; query_context={\"stage\":" + QuerySourceQuote(stage) +
-		             ",\"query\":" + QuerySourceQuote(query) + ",\"protocol\":" +
-		             QuerySourceQuote(statement ? "prepared" : "text") +
-		             ",\"statement_errno\":" + std::to_string(statement ? mysql_stmt_errno(statement) : 0) +
-		             ",\"connection_errno\":" + std::to_string(connection ? mysql_errno(connection) : 0) +
-		             ",\"statement_state\":" + QuerySourceQuote(statement ? mysql_stmt_sqlstate(statement) : "unavailable") +
-		             ",\"statement_message\":" + QuerySourceQuote(statement ? mysql_stmt_error(statement) : "unavailable") +
-		             ",\"connection_state\":" + QuerySourceQuote(connection ? mysql_sqlstate(connection) : "unavailable") +
-		             ",\"connection_message\":" + QuerySourceQuote(connection ? mysql_error(connection) : "unavailable") + "}";
+		e.message +=
+		    "; query_context={\"stage\":" + QuerySourceQuote(stage) + ",\"query\":" + QuerySourceQuote(query) +
+		    ",\"protocol\":" + QuerySourceQuote(statement ? "prepared" : "text") +
+		    ",\"statement_errno\":" + std::to_string(statement ? mysql_stmt_errno(statement) : 0) +
+		    ",\"connection_errno\":" + std::to_string(connection ? mysql_errno(connection) : 0) +
+		    ",\"statement_state\":" + QuerySourceQuote(statement ? mysql_stmt_sqlstate(statement) : "unavailable") +
+		    ",\"statement_message\":" + QuerySourceQuote(statement ? mysql_stmt_error(statement) : "unavailable") +
+		    ",\"connection_state\":" + QuerySourceQuote(connection ? mysql_sqlstate(connection) : "unavailable") +
+		    ",\"connection_message\":" + QuerySourceQuote(connection ? mysql_error(connection) : "unavailable") + "}";
 	}
-	return QuerySourceMessage(e.state.empty() || e.state == "00000" ? "" : e.JSON(), e.message, stage, query);
+	return QuerySourceMessage(e.state.empty() || e.state == "00000" ? "" : e.JSON(), e.message, stage, query, "mysql");
 }
 } // namespace duckdb
