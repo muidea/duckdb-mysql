@@ -108,14 +108,178 @@ static string StableCreate(const string &ddl) {
     }
     return out;
 }
+
+// Canonical PostgreSQL type identity emitted to the federation. The extension
+// owns the native -> PG mapping; the Go mutation layer must not branch on
+// MySQL data_type/column_type for type identity.
+struct CanonicalPGType {
+    string name;
+    int oid = 0;
+    int typmod = -1;
+    bool supported = false;
+    string reason;
+};
+
+static bool Digits(const string &s) {
+    if (s.empty()) return false;
+    for (char ch : s) if (ch < '0' || ch > '9') return false;
+    return true;
+}
+
+static bool ParenInt(const string &column_type, const string &prefix, int &value) {
+    if (column_type.rfind(prefix + "(", 0) != 0) return false;
+    auto close = column_type.find(')', prefix.size() + 1);
+    if (close == string::npos || close + 1 != column_type.size()) return false;
+    auto inner = column_type.substr(prefix.size() + 1, close - prefix.size() - 1);
+    if (!Digits(inner) || inner.size() > 6) return false;
+    value = 0;
+    for (char ch : inner) value = value * 10 + (ch - '0');
+    return true;
+}
+
+static bool DecimalArgs(const string &column_type, int &precision, int &scale) {
+    if (column_type.rfind("decimal(", 0) != 0) return false;
+    auto close = column_type.find(')');
+    if (close == string::npos) return false;
+    auto inner = column_type.substr(8, close - 8);
+    auto comma = inner.find(',');
+    if (comma == string::npos) return false;
+    auto p = inner.substr(0, comma), s = inner.substr(comma + 1);
+    if (!Digits(p) || !Digits(s) || p.size() > 4 || s.size() > 3) return false;
+    precision = 0; scale = 0;
+    for (char ch : p) precision = precision * 10 + (ch - '0');
+    for (char ch : s) scale = scale * 10 + (ch - '0');
+    return precision >= 1 && precision <= 65 && scale >= 0 && scale <= precision && scale <= 30;
+}
+
+static CanonicalPGType Canonical(const string &data_type, const string &column_type,
+                                 const string &charset, const string &collation) {
+    CanonicalPGType out;
+    const bool no_text = charset.empty() && collation.empty();
+    // Mirror the established compatibility rule: utf8/utf8mb3/utf8mb4 with a
+    // matching collation prefix is eligible for assignment. The narrower
+    // utf8mb4_0900_bin rule applies to text predicates, not to every write.
+    const bool unicode_text = (charset == "utf8" || charset == "utf8mb3" || charset == "utf8mb4") &&
+        collation.rfind(charset + "_", 0) == 0;
+    const bool unsigned_type = column_type.find("unsigned") != string::npos || column_type.find("zerofill") != string::npos;
+    int p = 0, s = 0;
+    if (unsigned_type) {
+        out.name = "numeric";
+        out.oid = 1700;
+        if (data_type == "tinyint") p = 3;
+        else if (data_type == "smallint") p = 5;
+        else if (data_type == "mediumint") p = 10; // DuckDB exposes this family as UINTEGER
+        else if (data_type == "int") p = 10;
+        else if (data_type == "bigint") p = 20;
+        else if (data_type == "decimal") {
+            if (!DecimalArgs(column_type.substr(0, column_type.find(' ')), p, s) || p > 38) { out.name.clear(); return out; }
+        } else { out.name.clear(); return out; }
+        out.typmod = ((p & 0xffff) << 16 | (s & 0x7ff)) + 4;
+        // Canonical NUMERIC(p,0); pg_adapter normalizes the unsigned DuckDB
+        // family before exporting the mutation plan.
+        out.supported = true;
+        return out;
+    }
+    if (data_type == "tinyint") {
+        // Phase 1 preserves the existing TinyInt/BOOLEAN compatibility path; the
+        // canonical int2 mapping requires the TinyInt range rules to move here.
+        return out;
+    }
+    if (data_type == "smallint") { out.name = "int2"; out.oid = 21; out.supported = true; return out; }
+    if (data_type == "mediumint" || data_type == "int") { out.name = "int4"; out.oid = 23; out.supported = true; return out; }
+    if (data_type == "bigint") { out.name = "int8"; out.oid = 20; out.supported = true; return out; }
+    if (data_type == "decimal") {
+        if (!DecimalArgs(column_type, p, s) || !no_text || p > 38) return out;
+        out.name = "numeric"; out.oid = 1700;
+        out.typmod = ((p & 0xffff) << 16 | (s & 0x7ff)) + 4;
+        out.supported = true;
+        return out;
+    }
+    if (data_type == "float" || data_type == "double") {
+        out.name = data_type == "float" ? "float4" : "float8";
+        out.oid = data_type == "float" ? 700 : 701;
+        out.supported = column_type == data_type && no_text;
+        if (!out.supported) out.reason = "float_display_or_collation_not_certified";
+        return out;
+    }
+    if (data_type == "date") {
+        out.name = "date"; out.oid = 1082;
+        out.supported = column_type == "date" && no_text;
+        if (!out.supported) out.reason = "date_metadata_not_certified";
+        return out;
+    }
+    if (data_type == "datetime" || data_type == "timestamp" || data_type == "time") {
+        int precision = 0;
+        if (column_type != data_type && !ParenInt(column_type, data_type, precision)) return out;
+        if (precision > 6 || !no_text) return out;
+        if (data_type == "datetime") { out.name = "timestamp"; out.oid = 1114; out.typmod = precision; out.supported = true; }
+        else if (data_type == "timestamp") { out.name = "timestamptz"; out.oid = 1184; out.typmod = precision; out.supported = false; out.reason = "timezone_semantics_not_established"; }
+        else { out.name = "time"; out.oid = 1083; out.typmod = precision; out.supported = false; out.reason = "mysql_time_not_supported"; }
+        return out;
+    }
+    if (data_type == "year") { out.name = "int2"; out.oid = 21; out.supported = false; out.reason = "year_not_supported"; return out; }
+    if (data_type == "char" || data_type == "varchar") {
+        int length = 0;
+        if (!ParenInt(column_type, data_type, length)) return out;
+        out.name = data_type == "char" ? "bpchar" : "varchar";
+        out.oid = data_type == "char" ? 1042 : 1043;
+        out.typmod = length + 4;
+        out.supported = unicode_text;
+        if (!out.supported) out.reason = "text_collation_not_certified";
+        return out;
+    }
+    if (data_type == "tinytext" || data_type == "text" || data_type == "mediumtext" || data_type == "longtext") {
+        out.name = "text"; out.oid = 25;
+        out.supported = unicode_text;
+        if (!out.supported) out.reason = "text_collation_not_certified";
+        return out;
+    }
+    if (data_type == "binary" || data_type == "varbinary") {
+        int length = 0;
+        if (!ParenInt(column_type, data_type, length)) return out;
+        out.name = "bytea"; out.oid = 17;
+        out.supported = no_text;
+        if (!out.supported) out.reason = "binary_collation_not_certified";
+        return out;
+    }
+    if (data_type == "tinyblob" || data_type == "blob" || data_type == "mediumblob" || data_type == "longblob") {
+        out.name = "bytea"; out.oid = 17;
+        out.supported = column_type == data_type && no_text;
+        if (!out.supported) out.reason = "blob_metadata_not_certified";
+        return out;
+    }
+    if (data_type == "enum") {
+        out.name = "text"; out.oid = 25;
+        out.supported = unicode_text;
+        if (!out.supported) out.reason = "enum_collation_not_certified";
+        return out;
+    }
+    if (data_type == "set") { out.name = "text"; out.oid = 25; out.supported = false; out.reason = "set_not_supported"; return out; }
+    if (data_type == "json") { out.name = "jsonb"; out.oid = 3802; out.supported = false; out.reason = "json_write_semantics_not_established"; return out; }
+    if (data_type == "bit") {
+        int length = 0;
+        if (!ParenInt(column_type, "bit", length)) return out;
+        out.name = "varbit"; out.oid = 1562; out.typmod = length; out.supported = false; out.reason = "bit_not_supported";
+        return out;
+    }
+    if (data_type == "geometry" || data_type == "point" || data_type == "linestring" || data_type == "polygon" ||
+        data_type == "multipoint" || data_type == "multilinestring" || data_type == "multipolygon" || data_type == "geomcollection") {
+        out.name = "text"; out.oid = 25; out.supported = false; out.reason = "spatial_not_supported"; return out;
+    }
+    return out;
+}
+
 static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
     vector<Value> args={Value(d.schema),Value(d.table)};
     auto table=Query(c,"SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",args);
     if (!table->Next() || table->GetString(0)!="BASE TABLE" || table->GetString(1)!="InnoDB" || table->Next()) Reject();
     auto id=Scalar(c, string("SELECT CAST(TABLE_ID AS CHAR) FROM information_schema.") +
         (modern_innodb ? "INNODB_TABLES" : "INNODB_SYS_TABLES") + " WHERE NAME=CONCAT(?,'/',?)",args);
-    auto features=Scalar(c,"SELECT CAST((SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? AND EVENT_OBJECT_TABLE=?) + (SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND CONSTRAINT_TYPE NOT IN ('PRIMARY KEY','UNIQUE')) + (SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND PARTITION_NAME IS NOT NULL) AS CHAR)",
-        {Value(d.schema),Value(d.table),Value(d.schema),Value(d.table),Value(d.schema),Value(d.table)});
+    // Foreign keys and CHECK constraints are source-enforced; they no longer
+    // disable the whole table. Triggers and partitions retain separate
+    // semantics and stay outside the guarded mutation contract.
+    auto features=Scalar(c,"SELECT CAST((SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=? AND EVENT_OBJECT_TABLE=?) + (SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND PARTITION_NAME IS NOT NULL) AS CHAR)",
+        {Value(d.schema),Value(d.table),Value(d.schema),Value(d.table)});
     if (features!="0") Reject();
     auto create=Query(c,"SHOW CREATE TABLE "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table));
     if (!create->Next()) Reject(); auto ddl=StableCreate(create->GetString(1));
@@ -133,7 +297,15 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
         if (!cols->IsNull(8) && (cols->GetString(1)=="datetime" || cols->GetString(1)=="timestamp") &&
             StringUtil::Upper(cols->GetString(8)).find("CURRENT_TIMESTAMP")==0) Reject();
         if (!first) out+=","; first=false;
-        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"has_default\":"+(!cols->IsNull(8)?"true":"false")+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false")+"}";
+        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"has_default\":"+(!cols->IsNull(8)?"true":"false")+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false");
+        auto pg = Canonical(cols->GetString(1), cols->GetString(2), cols->GetString(4), cols->GetString(5));
+        if (!pg.name.empty()) {
+            out+=",\"pg_type\":{\"schema\":\"pg_catalog\",\"name\":"+Quote(pg.name)+",\"oid\":"+std::to_string(pg.oid)+",\"typmod\":"+std::to_string(pg.typmod)+"}";
+            out+=",\"write\":{\"supported\":"+string(pg.supported?"true":"false");
+            if (!pg.reason.empty()) out+=",\"reason\":"+Quote(pg.reason);
+            out+="}";
+        }
+        out+="}";
         if (out.size()>1024*1024) Reject();
     }
     return out+"]}";
