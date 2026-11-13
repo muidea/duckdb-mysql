@@ -218,7 +218,8 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	try {
 		if (ctx.IsInterrupted())
 			throw InterruptException();
-		if (d.catalog.GetBackendCapabilities().kind != MySQLBackendKind::MYSQL_STANDARD) {
+		const bool mariadb = d.catalog.GetBackendCapabilities().kind == MySQLBackendKind::MARIADB_STANDARD;
+		if (!mariadb && d.catalog.GetBackendCapabilities().kind != MySQLBackendKind::MYSQL_STANDARD) {
 			error = "0A000";
 			throw IOException("DDL source unsupported");
 		}
@@ -235,18 +236,21 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		bool distribution =
 		    ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
 		    ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
-		if ((!distribution && comment.find("MySQL") == string::npos) ||
+		if (((mariadb && comment.find("MariaDB") == string::npos) ||
+		     (!mariadb && !distribution && comment.find("MySQL") == string::npos)) ||
 		    Scalar(raw, "SELECT DATABASE()") != d.intent.database) {
 			error = "0A000";
 			throw IOException("DDL source not certified");
 		}
-		const bool change_column = d.intent.action == "rename_column" && !VersionAtLeast(version, 8, 0, 0);
-		if (change_column && !VersionAtLeast(version, 5, 7, 0)) {
+		const bool change_column = d.intent.action == "rename_column" &&
+		                           (mariadb ? !VersionAtLeast(version, 10, 5, 0) : !VersionAtLeast(version, 8, 0, 0));
+		if (change_column && !mariadb && !VersionAtLeast(version, 5, 7, 0)) {
 			error = "0A000";
 			throw IOException("DDL column rename has no equivalent native syntax");
 		}
 		if (d.intent.action == "add_constraint" && d.intent.constraint_kind == "check" &&
-		    (!VersionAtLeast(version,8,0,16) || Scalar(raw,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='TABLE_CONSTRAINTS' AND COLUMN_NAME='ENFORCED'")!="1")) {
+		    (mariadb ? !VersionAtLeast(version, 10, 2, 1)
+		             : (!VersionAtLeast(version,8,0,16) || Scalar(raw,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='TABLE_CONSTRAINTS' AND COLUMN_NAME='ENFORCED'")!="1"))) {
 			error = "0A000";
 			throw IOException("DDL enforced CHECK is unavailable");
 		}
@@ -360,8 +364,9 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 				native_sql = "ALTER TABLE " + target + " DROP INDEX " + name;
 			else if (kind == "FOREIGN KEY")
 				native_sql = "ALTER TABLE " + target + " DROP FOREIGN KEY " + name;
-			else if (kind == "CHECK" && VersionAtLeast(version,8,0,16))
-				native_sql = "ALTER TABLE " + target + " DROP CHECK " + name;
+			else if (kind == "CHECK" && (mariadb ? VersionAtLeast(version, 10, 2, 1) : VersionAtLeast(version,8,0,16)))
+				native_sql = mariadb ? "ALTER TABLE " + target + " DROP CONSTRAINT " + name
+				                     : "ALTER TABLE " + target + " DROP CHECK " + name;
 			// If no supported catalog kind is visible, send the original
 			// native DROP CONSTRAINT form and retain the source's own error.
 		}

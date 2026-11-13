@@ -152,7 +152,8 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	try {
 		if (ctx.IsInterrupted())
 			throw InterruptException();
-		if (d.catalog.GetBackendCapabilities().kind != MySQLBackendKind::MYSQL_STANDARD) {
+		const bool mariadb = d.catalog.GetBackendCapabilities().kind == MySQLBackendKind::MARIADB_STANDARD;
+		if (!mariadb && d.catalog.GetBackendCapabilities().kind != MySQLBackendKind::MYSQL_STANDARD) {
 			error = "0A000";
 			throw IOException("DDL metadata adapter unavailable");
 		}
@@ -166,7 +167,9 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		bool distribution =
 		    ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
 		    ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
-		if ((!distribution && comment.find("MySQL") == string::npos) || Scalar(c, "SELECT DATABASE()") != d.schema) {
+		if (((mariadb && comment.find("MariaDB") == string::npos) ||
+		     (!mariadb && !distribution && comment.find("MySQL") == string::npos)) ||
+		    Scalar(c, "SELECT DATABASE()") != d.schema) {
 			error = "0A000";
 			throw IOException("DDL metadata identity mismatch");
 		}
@@ -185,8 +188,12 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 				error = "54000";
 				throw IOException("DDL metadata bound exceeded");
 			}
+			std::string describe_sql = DescribeSQL;
+			if (mariadb) {
+				describe_sql = StringUtil::Replace(describe_sql, "@@server_uuid", "CONCAT(@@server_id,':',@@hostname,':',@@port)");
+			}
 			document =
-			    Scalar(c, DescribeSQL,
+			    Scalar(c, describe_sql,
 			           {Value(d.schema), Value(d.name), Value(d.kind), Value(d.schema), Value(d.schema), Value(d.name),
 			            Value(d.schema), Value(d.kind), Value(d.name), Value(d.kind), Value(d.name)});
 		} else {
@@ -199,7 +206,12 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
                 else if(flag!="OFF" && flag!="0")throw IOException("DDL session capability unavailable");
             }
             if(flags<1 || flags>2)throw IOException("DDL session capability unavailable");
-			document = Scalar(c, CapabilitiesSQL, {Value(d.schema), Value(d.schema), Value(session_read_only)});
+			std::string capabilities_sql = CapabilitiesSQL;
+			if (mariadb) {
+				capabilities_sql =
+				    StringUtil::Replace(capabilities_sql, "@@server_uuid", "CONCAT(@@server_id,':',@@hostname,':',@@port)");
+			}
+			document = Scalar(c, capabilities_sql, {Value(d.schema), Value(d.schema), Value(session_read_only)});
 		}
 		if (document.size() > 1024 * 1024 || mysql_warning_count(c.GetConn()) != 0) {
 			error = "54000";
