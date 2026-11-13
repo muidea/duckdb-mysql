@@ -289,7 +289,11 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
     while(cols->Next()) {
         bool automatic=cols->GetString(6)=="auto_increment";
         bool primary=cols->GetString(9)=="1" && cols->GetString(10)=="PRI";
-        if ((!cols->GetString(6).empty() && !automatic) || !cols->GetString(7).empty() ||
+        // Generated columns are source-maintained and must be omitted from
+        // writes. Keep the table usable for its other columns; reject only an
+        // actual reference to the generated column through write.supported.
+        bool generated=!cols->GetString(7).empty();
+        if ((!generated && !cols->GetString(6).empty() && !automatic) ||
             (automatic && (!primary || (cols->GetString(1)!="smallint" && cols->GetString(1)!="int" && cols->GetString(1)!="bigint") || cols->GetString(2).find("unsigned")!=string::npos))) Reject();
         // Literal defaults remain source semantics, never translated into SQL.
         // Generated/ON UPDATE expressions stay outside this contract. Older
@@ -298,7 +302,9 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
             StringUtil::Upper(cols->GetString(8)).find("CURRENT_TIMESTAMP")==0) Reject();
         if (!first) out+=","; first=false;
         out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"has_default\":"+(!cols->IsNull(8)?"true":"false")+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false");
+        if (generated) out+=",\"generated\":true";
         auto pg = Canonical(cols->GetString(1), cols->GetString(2), cols->GetString(4), cols->GetString(5));
+        if (generated) { pg.supported=false; pg.reason="generated_column_not_writable"; }
         if (!pg.name.empty()) {
             out+=",\"pg_type\":{\"schema\":\"pg_catalog\",\"name\":"+Quote(pg.name)+",\"oid\":"+std::to_string(pg.oid)+",\"typmod\":"+std::to_string(pg.typmod)+"}";
             out+=",\"write\":{\"supported\":"+string(pg.supported?"true":"false");
