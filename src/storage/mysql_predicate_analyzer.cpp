@@ -1,9 +1,13 @@
 #include "storage/mysql_predicate_analyzer.hpp"
 #include "mysql_utils.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 
 #include <cmath>
 #include <unordered_set>
@@ -25,25 +29,103 @@ void PredicateAnalyzer::SetPushThresholds(double with_index, double no_index) {
 	push_threshold_no_index_ = no_index;
 }
 
-bool PredicateAnalyzer::IsPushableFilterType(TableFilterType type) const {
-	switch (type) {
-	case TableFilterType::IS_NULL:
-	case TableFilterType::IS_NOT_NULL:
-	case TableFilterType::CONJUNCTION_AND:
-	case TableFilterType::CONJUNCTION_OR:
-	case TableFilterType::CONSTANT_COMPARISON:
-	case TableFilterType::OPTIONAL_FILTER:
-	case TableFilterType::IN_FILTER:
-		return true;
-	case TableFilterType::DYNAMIC_FILTER:
+static bool IsDirectColumnRefExpr(const Expression &expr) {
+	return expr.GetExpressionClass() == ExpressionClass::BOUND_REF ||
+	       expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF;
+}
+
+static const Expression *UnwrapOptionalFilterExpr(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return nullptr;
+	}
+	auto &func = expr.Cast<BoundFunctionExpression>();
+	if (func.Function().GetName() == OptionalFilterScalarFun::NAME && func.BindInfo()) {
+		return func.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
+	}
+	if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME && func.BindInfo()) {
+		return func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
+	}
+	return nullptr;
+}
+
+static bool ExtractComparisonConstant(const Expression &expr, ExpressionType &cmp_type, const Value *&constant) {
+	if (!BoundComparisonExpression::IsComparison(expr)) {
 		return false;
+	}
+	auto &cmp = expr.Cast<BoundFunctionExpression>();
+	cmp_type = cmp.GetExpressionType();
+	auto &left = BoundComparisonExpression::Left(cmp);
+	auto &right = BoundComparisonExpression::Right(cmp);
+	if (IsDirectColumnRefExpr(left) && right.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		constant = &right.Cast<BoundConstantExpression>().GetValue();
+		return true;
+	}
+	if (left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT && IsDirectColumnRefExpr(right)) {
+		constant = &left.Cast<BoundConstantExpression>().GetValue();
+		cmp_type = FlipComparisonExpression(cmp_type);
+		return true;
+	}
+	return false;
+}
+
+static bool IsPushableFilterExpression(const Expression &expr) {
+	ExpressionType cmp_type;
+	const Value *constant = nullptr;
+	if (ExtractComparisonConstant(expr, cmp_type, constant)) {
+		return true;
+	}
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		for (const auto &child : conj.GetChildren()) {
+			if (!IsPushableFilterExpression(*child)) {
+				return false;
+			}
+		}
+		return !conj.GetChildren().empty();
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		auto &children = op.GetChildren();
+		if (children.empty() || !IsDirectColumnRefExpr(*children[0])) {
+			return false;
+		}
+		switch (op.GetExpressionType()) {
+		case ExpressionType::OPERATOR_IS_NULL:
+		case ExpressionType::OPERATOR_IS_NOT_NULL:
+			return true;
+		case ExpressionType::COMPARE_IN:
+			for (idx_t i = 1; i < children.size(); i++) {
+				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					return false;
+				}
+			}
+			return children.size() > 1;
+		default:
+			return false;
+		}
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		if (const auto *inner = UnwrapOptionalFilterExpr(expr)) {
+			return IsPushableFilterExpression(*inner);
+		}
+		return false;
+	}
 	default:
 		return false;
 	}
 }
 
+bool PredicateAnalyzer::IsPushableFilterType(TableFilterType type) const {
+	return type == TableFilterType::EXPRESSION_FILTER;
+}
+
 bool PredicateAnalyzer::CanPushFilter(TableFilter &filter) const {
-	return IsPushableFilterType(filter.filter_type);
+	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+		return false;
+	}
+	auto &ef = filter.Cast<ExpressionFilter>();
+	return ef.expr && IsPushableFilterExpression(*ef.expr);
 }
 
 string PredicateAnalyzer::TransformComparisonOperator(ExpressionType type) const {
@@ -75,127 +157,167 @@ string PredicateAnalyzer::CreateConjunction(const vector<string> &predicates, co
 	return "(" + StringUtil::Join(predicates, " " + op + " ") + ")";
 }
 
-string PredicateAnalyzer::TransformFilterToMySQL(const string &column_name, TableFilter &filter) const {
-	string col_escaped = MySQLUtils::WriteIdentifier(column_name);
-
-	switch (filter.filter_type) {
-	case TableFilterType::IS_NULL:
-		return col_escaped + " IS NULL";
-	case TableFilterType::IS_NOT_NULL:
-		return col_escaped + " IS NOT NULL";
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
-		vector<string> child_predicates;
-		for (const auto &child : conjunction.child_filters) {
-			auto pred = TransformFilterToMySQL(column_name, *child);
-			if (!pred.empty()) {
-				child_predicates.push_back(pred);
-			}
-		}
-		return CreateConjunction(child_predicates, "AND");
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conjunction = filter.Cast<ConjunctionOrFilter>();
-		vector<string> child_predicates;
-		for (const auto &child : conjunction.child_filters) {
-			auto pred = TransformFilterToMySQL(column_name, *child);
-			if (!pred.empty()) {
-				child_predicates.push_back(pred);
-			}
-		}
-		return CreateConjunction(child_predicates, "OR");
-	}
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &constant_filter = filter.Cast<ConstantFilter>();
-		auto constant_string = MySQLUtils::TransformConstant(constant_filter.constant);
-		auto operator_string = TransformComparisonOperator(constant_filter.comparison_type);
+static string TransformExprToMySQL(const string &col_escaped, const Expression &expr,
+                                   const std::function<string(ExpressionType)> &cmp_op_fn) {
+	ExpressionType cmp_type;
+	const Value *constant = nullptr;
+	if (ExtractComparisonConstant(expr, cmp_type, constant)) {
+		auto constant_string = MySQLUtils::TransformConstant(*constant);
+		auto operator_string = cmp_op_fn(cmp_type);
 		if (operator_string.empty()) {
 			return "";
 		}
 		return StringUtil::Format("%s %s %s", col_escaped, operator_string, constant_string);
 	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &optional_filter = filter.Cast<OptionalFilter>();
-		return TransformFilterToMySQL(column_name, *optional_filter.child_filter);
-	}
-	case TableFilterType::IN_FILTER: {
-		auto &in_filter = filter.Cast<InFilter>();
-		if (in_filter.values.empty()) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		auto op = conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "AND" : "OR";
+		vector<string> parts;
+		for (const auto &child : conj.GetChildren()) {
+			auto pred = TransformExprToMySQL(col_escaped, *child, cmp_op_fn);
+			if (!pred.empty()) {
+				parts.push_back(std::move(pred));
+			}
+		}
+		if (parts.empty()) {
 			return "";
 		}
-		string in_list;
-		for (const auto &val : in_filter.values) {
-			if (!in_list.empty()) {
-				in_list += ", ";
-			}
-			in_list += MySQLUtils::TransformConstant(val);
+		if (parts.size() == 1) {
+			return parts[0];
 		}
-		return col_escaped + " IN (" + in_list + ")";
+		return "(" + StringUtil::Join(parts, " " + string(op) + " ") + ")";
 	}
-	case TableFilterType::DYNAMIC_FILTER:
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		auto &children = op.GetChildren();
+		if (children.empty() || !IsDirectColumnRefExpr(*children[0])) {
+			return "";
+		}
+		switch (op.GetExpressionType()) {
+		case ExpressionType::OPERATOR_IS_NULL:
+			return col_escaped + " IS NULL";
+		case ExpressionType::OPERATOR_IS_NOT_NULL:
+			return col_escaped + " IS NOT NULL";
+		case ExpressionType::COMPARE_IN: {
+			if (children.size() <= 1) {
+				return "";
+			}
+			string in_list;
+			for (idx_t i = 1; i < children.size(); i++) {
+				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					return "";
+				}
+				if (!in_list.empty()) {
+					in_list += ", ";
+				}
+				in_list += MySQLUtils::TransformConstant(children[i]->Cast<BoundConstantExpression>().GetValue());
+			}
+			return col_escaped + " IN (" + in_list + ")";
+		}
+		default:
+			return "";
+		}
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		if (const auto *inner = UnwrapOptionalFilterExpr(expr)) {
+			return TransformExprToMySQL(col_escaped, *inner, cmp_op_fn);
+		}
 		return "";
+	}
 	default:
 		return "";
 	}
 }
 
-double PredicateAnalyzer::EstimateFilterSelectivity(const string &column_name, TableFilter &filter) {
-	switch (filter.filter_type) {
-	case TableFilterType::IS_NULL: {
-		auto it = table_stats_.column_null_fraction.find(column_name);
-		if (it != table_stats_.column_null_fraction.end()) {
-			return it->second;
-		}
-		return 0.01;
+string PredicateAnalyzer::TransformFilterToMySQL(const string &column_name, TableFilter &filter) const {
+	string col_escaped = MySQLUtils::WriteIdentifier(column_name);
+	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+		return "";
 	}
-	case TableFilterType::IS_NOT_NULL: {
-		auto it = table_stats_.column_null_fraction.find(column_name);
-		if (it != table_stats_.column_null_fraction.end()) {
-			return 1.0 - it->second;
-		}
-		return 0.99;
+	auto &ef = filter.Cast<ExpressionFilter>();
+	if (!ef.expr) {
+		return "";
 	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
-		double selectivity = 1.0;
-		for (const auto &child : conjunction.child_filters) {
-			selectivity *= EstimateFilterSelectivity(column_name, *child);
-		}
-		return selectivity;
+	return TransformExprToMySQL(col_escaped, *ef.expr,
+	                            [this](ExpressionType type) { return TransformComparisonOperator(type); });
+}
+
+static double EstimateExprSelectivity(MySQLStatisticsCollector &stats, const MySQLTableStats &table_stats,
+                                      const string &schema, const string &table, const string &column_name,
+                                      const Expression &expr) {
+	ExpressionType cmp_type;
+	const Value *constant = nullptr;
+	if (ExtractComparisonConstant(expr, cmp_type, constant)) {
+		return stats.EstimateSelectivity(schema, table, column_name, cmp_type, *constant);
 	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conjunction = filter.Cast<ConjunctionOrFilter>();
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			double selectivity = 1.0;
+			for (const auto &child : conj.GetChildren()) {
+				selectivity *= EstimateExprSelectivity(stats, table_stats, schema, table, column_name, *child);
+			}
+			return selectivity;
+		}
 		double combined = 1.0;
-		for (const auto &child : conjunction.child_filters) {
-			double child_sel = EstimateFilterSelectivity(column_name, *child);
+		for (const auto &child : conj.GetChildren()) {
+			double child_sel = EstimateExprSelectivity(stats, table_stats, schema, table, column_name, *child);
 			combined *= (1.0 - child_sel);
 		}
 		return 1.0 - combined;
 	}
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &constant_filter = filter.Cast<ConstantFilter>();
-		return stats_.get().EstimateSelectivity(schema_, table_, column_name, constant_filter.comparison_type,
-		                                        constant_filter.constant);
-	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &optional_filter = filter.Cast<OptionalFilter>();
-		return EstimateFilterSelectivity(column_name, *optional_filter.child_filter);
-	}
-	case TableFilterType::IN_FILTER: {
-		auto &in_filter = filter.Cast<InFilter>();
-		auto it = table_stats_.column_distinct_count.find(column_name);
-		if (it != table_stats_.column_distinct_count.end() && it->second > 0) {
-			return std::min(static_cast<double>(in_filter.values.size()) / static_cast<double>(it->second), 1.0);
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		switch (op.GetExpressionType()) {
+		case ExpressionType::OPERATOR_IS_NULL: {
+			auto it = table_stats.column_null_fraction.find(column_name);
+			if (it != table_stats.column_null_fraction.end()) {
+				return it->second;
+			}
+			return 0.01;
 		}
-		double per_value_selectivity = 0.01;
-		if (in_filter.values.size() > 10) {
-			per_value_selectivity = 0.005;
+		case ExpressionType::OPERATOR_IS_NOT_NULL: {
+			auto it = table_stats.column_null_fraction.find(column_name);
+			if (it != table_stats.column_null_fraction.end()) {
+				return 1.0 - it->second;
+			}
+			return 0.99;
 		}
-		return std::min(static_cast<double>(in_filter.values.size()) * per_value_selectivity, 0.8);
+		case ExpressionType::COMPARE_IN: {
+			idx_t value_count = op.GetChildren().size() > 1 ? op.GetChildren().size() - 1 : 0;
+			auto it = table_stats.column_distinct_count.find(column_name);
+			if (it != table_stats.column_distinct_count.end() && it->second > 0) {
+				return std::min(static_cast<double>(value_count) / static_cast<double>(it->second), 1.0);
+			}
+			double per_value_selectivity = value_count > 10 ? 0.005 : 0.01;
+			return std::min(static_cast<double>(value_count) * per_value_selectivity, 0.8);
+		}
+		default:
+			return PredicateAnalyzer::DEFAULT_SELECTIVITY;
+		}
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		if (const auto *inner = UnwrapOptionalFilterExpr(expr)) {
+			return EstimateExprSelectivity(stats, table_stats, schema, table, column_name, *inner);
+		}
+		return PredicateAnalyzer::DEFAULT_SELECTIVITY;
 	}
 	default:
+		return PredicateAnalyzer::DEFAULT_SELECTIVITY;
+	}
+}
+
+double PredicateAnalyzer::EstimateFilterSelectivity(const string &column_name, TableFilter &filter) {
+	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
 		return DEFAULT_SELECTIVITY;
 	}
+	auto &ef = filter.Cast<ExpressionFilter>();
+	if (!ef.expr) {
+		return DEFAULT_SELECTIVITY;
+	}
+	return EstimateExprSelectivity(stats_.get(), table_stats_, schema_, table_, column_name, *ef.expr);
 }
 
 PushdownDecision PredicateAnalyzer::MakePushdownDecision(double selectivity, bool has_index) const {
@@ -345,15 +467,15 @@ FilterAnalysisResult PredicateAnalyzer::AnalyzeFilters(const vector<column_t> &c
                                                        const vector<string> &names) {
 	FilterAnalysisResult result;
 
-	if (!filters || filters->filters.empty()) {
+	if (!filters || !filters->HasFilters()) {
 		return result;
 	}
 
 	vector<string> pushed_predicates;
 
 	idx_t filter_count = 0;
-	for (const auto &entry : filters->filters) {
-		column_t col_idx = entry.first;
+	for (auto &entry : *filters) {
+		column_t col_idx = entry.GetIndex().GetIndexUnsafe();
 		if (col_idx >= column_ids.size()) {
 			continue;
 		}
@@ -362,7 +484,7 @@ FilterAnalysisResult PredicateAnalyzer::AnalyzeFilters(const vector<column_t> &c
 			continue;
 		}
 		string column_name = names[actual_col_idx];
-		auto &filter = *entry.second;
+		auto &filter = entry.Filter();
 
 		auto analysis = AnalyzeFilter(column_name, filter);
 		analysis.column_index = col_idx;

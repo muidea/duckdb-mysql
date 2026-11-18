@@ -11,22 +11,23 @@ MySQLIndexSet::MySQLIndexSet(MySQLSchemaEntry &schema) : MySQLInSchemaSet(schema
 }
 
 void MySQLIndexSet::DropEntry(ClientContext &context, DropInfo &info) {
-	auto entry = GetEntry(context, info.name);
+	auto index_name = info.GetQualifiedName().Name().GetIdentifierName();
+	auto entry = GetEntry(context, index_name);
 	if (!entry) {
 		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 			return;
 		}
-		throw CatalogException("Failed to DROP INDEX \"%s\": entry not found", info.name);
+		throw CatalogException("Failed to DROP INDEX \"%s\": entry not found", index_name);
 	}
 	auto &mysql_index = entry->Cast<MySQLIndexEntry>();
 	string drop_query = "DROP INDEX ";
-	drop_query += MySQLUtils::WriteIdentifier(info.name);
+	drop_query += MySQLUtils::WriteIdentifier(index_name);
 	drop_query += " ON ";
 	drop_query += MySQLUtils::WriteIdentifier(mysql_index.table_name);
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	transaction.Query(drop_query);
 
-	EraseEntryInternal(info.name);
+	EraseEntryInternal(index_name);
 }
 
 void MySQLIndexSet::LoadEntries(ClientContext &context) {
@@ -35,7 +36,7 @@ SELECT DISTINCT TABLE_NAME, INDEX_NAME
 FROM INFORMATION_SCHEMA.STATISTICS
 WHERE TABLE_SCHEMA = 'mysqlscanner';
 )",
-	                                 "${SCHEMA_NAME}", MySQLUtils::WriteLiteral(schema.name));
+	                                 "${SCHEMA_NAME}", MySQLUtils::WriteLiteral(schema.name.GetIdentifierName()));
 
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	auto result = transaction.Query(query);
@@ -43,9 +44,9 @@ WHERE TABLE_SCHEMA = 'mysqlscanner';
 		auto table_name = result->GetString(0);
 		auto index_name = result->GetString(1);
 		CreateIndexInfo info;
-		info.schema = schema.name;
-		info.table = table_name;
-		info.index_name = index_name;
+		info.SetSchema(schema.name);
+		info.table = Identifier(table_name);
+		info.SetIndexName(Identifier(index_name));
 		auto index_entry = make_uniq<MySQLIndexEntry>(catalog, schema, info, table_name);
 		CreateEntry(std::move(index_entry));
 	}

@@ -18,10 +18,11 @@ MySQLCreateIndex::MySQLCreateIndex(PhysicalPlan &physical_plan, unique_ptr<Creat
 SourceResultType MySQLCreateIndex::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                    OperatorSourceInput &input) const {
 	auto &catalog = table.catalog;
-	if (info->catalog == INVALID_CATALOG && info->schema == catalog.GetName()) {
-		info->schema = DEFAULT_SCHEMA;
+	if (info->GetQualifiedName().Catalog() == INVALID_CATALOG &&
+	    info->GetQualifiedName().Schema() == catalog.GetName()) {
+		info->SetSchema(DEFAULT_SCHEMA);
 	}
-	auto &schema = catalog.GetSchema(context.client, info->schema);
+	auto &schema = catalog.GetSchema(context.client, info->GetQualifiedName().Schema());
 	schema.CreateIndex(context.client, *info, table);
 
 	return SourceResultType::FINISHED;

@@ -48,14 +48,14 @@ static void ExactDecimalKey(DataChunk &args, ExpressionState &, Vector &result) 
 	});
 }
 
-static unique_ptr<FunctionData> BindExactDecimalKey(ClientContext &, ScalarFunction &function,
-                                                   vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() != 1 || arguments[0]->return_type.id() != LogicalTypeId::VARCHAR) {
+static unique_ptr<FunctionData> BindExactDecimalKey(BindScalarFunctionInput &input) {
+	auto &arguments = input.GetArguments();
+	if (arguments.size() != 1 || arguments[0]->GetReturnType().id() != LogicalTypeId::VARCHAR) {
 		throw BinderException("Exact MySQL decimal collation requires a string input");
 	}
 	// Keep the scanner alias on symbolic parameters. Casting it to plain
 	// VARCHAR invalidates DuckDB's shared parameter type during comparisons.
-	function.arguments[0] = arguments[0]->return_type;
+	input.GetBoundFunction().GetArguments()[0] = arguments[0]->GetReturnType();
 	return nullptr;
 }
 
@@ -227,10 +227,10 @@ void RegisterMySQLGuardedDDL(ExtensionLoader &loader);
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	ScalarFunction decimal_key("mysql_exact_decimal", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	ScalarFunction decimal_key(Identifier("mysql_exact_decimal"), {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	                           ExactDecimalKey, BindExactDecimalKey);
-	decimal_key.collation_handling = FunctionCollationHandling::IGNORE_COLLATIONS;
-	CreateCollationInfo exact_decimal("mysql_exact_decimal", decimal_key, false, false);
+	decimal_key.SetCollationHandling(FunctionCollationHandling::IGNORE_COLLATIONS);
+	CreateCollationInfo exact_decimal(Identifier("mysql_exact_decimal"), decimal_key, false, false);
 	loader.RegisterCollation(exact_decimal);
 #ifdef MYSQL_GUARDED_CRUD
     RegisterMySQLGuardedCRUD(loader);

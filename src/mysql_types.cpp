@@ -83,7 +83,7 @@ Value MySQLTypes::DecodeTextValue(const MySQLTypeConfig &config, const LogicalTy
 
 static bool GetBoolOption(ClientContext &context, const std::string &opt_name) {
 	Value val;
-	if (context.TryGetCurrentSetting(opt_name, val)) {
+	if (context.TryGetCurrentSetting(Identifier(opt_name), val)) {
 		return BooleanValue::Get(val);
 	}
 	return false;
@@ -168,10 +168,9 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 		// text and typmod rather than rounding through binary64.
 		if (type_info.precision > 38 && type_info.precision <= 65 && type_info.scale >= 0 &&
 		    type_info.scale <= 30 && type_info.scale <= type_info.precision) {
-			auto result = LogicalType::VARCHAR_COLLATION("mysql_exact_decimal");
-			result.SetAlias("MYSQL_DECIMAL(" + std::to_string(type_info.precision) + "," +
-			                std::to_string(type_info.scale) + ")");
-			return result;
+			return LogicalType::VARCHAR_COLLATION("mysql_exact_decimal")
+			    .WithAlias("MYSQL_DECIMAL(" + std::to_string(type_info.precision) + "," +
+			               std::to_string(type_info.scale) + ")");
 		}
 		throw NotImplementedException("MySQL decimal precision/scale cannot be represented losslessly");
 	} else if (type_info.type_name == "boolean") {

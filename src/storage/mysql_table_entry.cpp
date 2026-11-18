@@ -69,13 +69,17 @@ static bool TableIsInternal(const SchemaCatalogEntry &schema, const string &name
 }
 
 MySQLTableEntry::MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-    : TableCatalogEntry(catalog, schema, info) {
-	this->internal = TableIsInternal(schema, name);
+    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)) {
+	this->internal = TableIsInternal(schema, name.GetIdentifierName());
 }
 
 MySQLTableEntry::MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, MySQLTableInfo &info)
-    : TableCatalogEntry(catalog, schema, *info.create_info) {
-	this->internal = TableIsInternal(schema, name);
+    : TableCatalogEntry(catalog, schema, *info.create_info), columns(std::move(info.create_info->columns)) {
+	this->internal = TableIsInternal(schema, name.GetIdentifierName());
+}
+
+const ColumnList &MySQLTableEntry::GetColumns() const {
+	return columns;
 }
 
 unique_ptr<BaseStatistics> MySQLTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
@@ -91,9 +95,9 @@ void MySQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, Logica
 
 TableFunction MySQLTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto result = make_uniq<MySQLBindData>(*this);
-	for (auto &col : columns.Logical()) {
+	for (auto &col : GetColumns().Logical()) {
 		result->types.push_back(col.GetType());
-		result->names.push_back(col.GetName());
+		result->names.push_back(col.GetName().GetIdentifierName());
 	}
 
 	Value filter_pushdown;
@@ -115,7 +119,7 @@ TableStorageInfo MySQLTableEntry::GetStorageInfo(ClientContext &context) {
 	auto &db = transaction.GetConnection();
 	TableStorageInfo result;
 	result.cardinality = 0;
-	result.index_info = db.GetIndexInfo(name);
+	result.index_info = db.GetIndexInfo(name.GetIdentifierName());
 	return result;
 }
 

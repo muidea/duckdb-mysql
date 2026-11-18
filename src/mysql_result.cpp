@@ -191,8 +191,8 @@ string MySQLResult::GetString(idx_t col) {
 	MySQLField &f = fields[col];
 	if (f.duckdb_type.id() == LogicalTypeId::VARCHAR || f.duckdb_type.id() == LogicalTypeId::BLOB) {
 		Vector &vec = data_chunk.data[col];
-		string_t *data = FlatVector::GetData<string_t>(vec);
-		string_t &st = data[row_idx];
+		const string_t *data = FlatVector::GetData<string_t>(vec);
+		const string_t &st = data[row_idx];
 		return string(st.GetData(), st.GetSize());
 	}
 	throw InternalException("Get called for a String type, actual type: \"%s\", column: %zu, MySQL query \"%s\"\n",
@@ -204,10 +204,10 @@ int32_t MySQLResult::GetInt32(idx_t col) {
 	MySQLField &f = fields[col];
 	Vector &vec = data_chunk.data[col];
 	if (f.duckdb_type.id() == LogicalTypeId::INTEGER) {
-		int32_t *data = FlatVector::GetData<int32_t>(vec);
+		const int32_t *data = FlatVector::GetData<int32_t>(vec);
 		return data[row_idx];
 	} else if (f.duckdb_type.id() == LogicalTypeId::UINTEGER) {
-		uint32_t *data = FlatVector::GetData<uint32_t>(vec);
+		const uint32_t *data = FlatVector::GetData<uint32_t>(vec);
 		return static_cast<int32_t>(data[row_idx]);
 	}
 	throw InternalException("Get called for an Int32 type, actual type: \"%s\", column: %zu, MySQL query \"%s\"\n",
@@ -219,18 +219,18 @@ int64_t MySQLResult::GetInt64(idx_t col) {
 	MySQLField &f = fields[col];
 	Vector &vec = data_chunk.data[col];
 	if (f.duckdb_type.id() == LogicalTypeId::BIGINT) {
-		int64_t *data = FlatVector::GetData<int64_t>(vec);
+		const int64_t *data = FlatVector::GetData<int64_t>(vec);
 		return data[row_idx];
 	} else if (f.duckdb_type.id() == LogicalTypeId::UBIGINT) {
-		uint64_t *data = FlatVector::GetData<uint64_t>(vec);
+		const uint64_t *data = FlatVector::GetData<uint64_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	} else if (f.duckdb_type.id() == LogicalTypeId::DOUBLE) {
 		if (vec.GetType().id() == LogicalTypeId::DOUBLE) {
-			double *data = FlatVector::GetData<double>(vec);
+			const double *data = FlatVector::GetData<double>(vec);
 			return static_cast<uint64_t>(data[row_idx]);
 		} else if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
-			string_t *data = FlatVector::GetData<string_t>(vec);
-			string_t st = data[row_idx];
+			const string_t *data = FlatVector::GetData<string_t>(vec);
+			const string_t st = data[row_idx];
 			return atoll(st.GetData());
 		}
 	}
@@ -415,7 +415,7 @@ static void WriteTimeAsString(MySQLField &f, Vector &vec, idx_t row) {
 	}
 	string str = head + tail;
 	string_t st(str.c_str(), str.length());
-	auto data = FlatVector::GetData<string_t>(vec);
+	auto data = FlatVector::GetDataMutable<string_t>(vec);
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
@@ -425,7 +425,7 @@ static void WriteString(MySQLField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
-	auto data = FlatVector::GetData<string_t>(vec);
+	auto data = FlatVector::GetDataMutable<string_t>(vec);
 
 	if (f.varlen_buffer.size() > 0) {
 		string_t st(f.varlen_buffer.data(), f.varlen_buffer.size());
@@ -440,7 +440,7 @@ static void WriteString(MySQLField &f, Vector &vec, idx_t row) {
 
 static void WriteBool(MySQLField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(int8_t));
-	auto data = FlatVector::GetData<bool>(vec);
+	auto data = FlatVector::GetDataMutable<bool>(vec);
 	if (f.mysql_type == MYSQL_TYPE_TINY) {
 		int8_t val = *reinterpret_cast<int8_t *>(f.bind_buffer.data());
 		data[row] = val != 0;
@@ -473,7 +473,7 @@ template <typename NUM_TYPE>
 static void WriteNumber(MySQLField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(NUM_TYPE));
 	NUM_TYPE num = *reinterpret_cast<NUM_TYPE *>(f.bind_buffer.data());
-	auto data = FlatVector::GetData<NUM_TYPE>(vec);
+	auto data = FlatVector::GetDataMutable<NUM_TYPE>(vec);
 	data[row] = num;
 }
 
@@ -498,7 +498,7 @@ static void WriteDateTime(MySQLTypeConfig &type_config, MySQLField &f, Vector &v
 	switch (vec.GetType().id()) {
 	case LogicalTypeId::DATE: {
 		date_t val = Date::FromDate(mt->year, mt->month, mt->day);
-		date_t *data = FlatVector::GetData<date_t>(vec);
+		date_t *data = FlatVector::GetDataMutable<date_t>(vec);
 		data[row] = val;
 		break;
 	}
@@ -508,7 +508,7 @@ static void WriteDateTime(MySQLTypeConfig &type_config, MySQLField &f, Vector &v
 			throw BinderException("time field value out of range, hour value: " + std::to_string(mt->hour));
 		}
 		dtime_t val = Time::FromTime(mt->hour, mt->minute, mt->second, mt->second_part);
-		dtime_t *data = FlatVector::GetData<dtime_t>(vec);
+		dtime_t *data = FlatVector::GetDataMutable<dtime_t>(vec);
 		data[row] = val;
 		break;
 	}
@@ -516,7 +516,7 @@ static void WriteDateTime(MySQLTypeConfig &type_config, MySQLField &f, Vector &v
 		date_t dt = Date::FromDate(mt->year, mt->month, mt->day);
 		dtime_t tm = Time::FromTime(mt->hour, mt->minute, mt->second, mt->second_part);
 		timestamp_t val = Timestamp::FromDatetime(dt, tm);
-		timestamp_t *data = FlatVector::GetData<timestamp_t>(vec);
+		timestamp_t *data = FlatVector::GetDataMutable<timestamp_t>(vec);
 		data[row] = val;
 		break;
 	}

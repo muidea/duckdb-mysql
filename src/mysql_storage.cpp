@@ -1,6 +1,8 @@
 #include "duckdb.hpp"
 
 #include "mysql_storage.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/storage/storage_extension.hpp"
 #include "mysql_connection_pool.hpp"
 #include "storage/mysql_catalog.hpp"
 #include "duckdb/main/settings.hpp"

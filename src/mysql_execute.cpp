@@ -22,14 +22,14 @@ struct MySQLExecuteBindData : public TableFunctionData {
 };
 
 static duckdb::unique_ptr<FunctionData> MySQLExecuteBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.emplace_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 
 	// look up the database to query
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto &db_manager = DatabaseManager::Get(context);
-	auto db = db_manager.GetDatabase(context, db_name);
+	auto db = db_manager.GetDatabase(context, Identifier(db_name));
 	if (!db) {
 		throw BinderException("Failed to find attached database \"%s\" referenced in mysql_query", db_name);
 	}
@@ -68,7 +68,7 @@ static void MySQLExecuteFunc(ClientContext &context, TableFunctionInput &data_p,
 
 MySQLExecuteFunction::MySQLExecuteFunction()
     : TableFunction("mysql_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLExecuteFunc, MySQLExecuteBind) {
-	named_parameters["params"] = LogicalType::ANY;
+	GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) { options.Add("params", LogicalType::ANY); });
 }
 
 } // namespace duckdb

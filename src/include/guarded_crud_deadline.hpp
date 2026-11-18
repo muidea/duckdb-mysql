@@ -1,4 +1,5 @@
 #pragma once
+#include "duckdb/main/client_context.hpp"
 #include <thread>
 #include <mutex>
 #include <condition_variable>

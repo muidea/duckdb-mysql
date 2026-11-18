@@ -42,7 +42,8 @@ void MySQLCatalogSet::DropEntry(ClientContext &context, DropInfo &info) {
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		drop_query += " IF EXISTS ";
 	}
-	drop_query += MySQLUtils::WriteIdentifier(info.name);
+	auto drop_name = info.GetQualifiedName().Name().GetIdentifierName();
+	drop_query += MySQLUtils::WriteIdentifier(drop_name);
 	if (info.type != CatalogType::SCHEMA_ENTRY) {
 		if (info.cascade) {
 			drop_query += " CASCADE";
@@ -52,7 +53,7 @@ void MySQLCatalogSet::DropEntry(ClientContext &context, DropInfo &info) {
 	transaction.Query(drop_query);
 
 	// erase the entry from the catalog set
-	EraseEntryInternal(info.name);
+	EraseEntryInternal(drop_name);
 }
 
 void MySQLCatalogSet::EraseEntryInternal(const string &name) {

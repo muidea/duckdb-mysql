@@ -34,9 +34,9 @@ void MySQLTableSet::AddColumn(ClientContext &context, MySQLResult &result, MySQL
 	type_info.scale = result.IsNull(column_index + 6) ? -1 : result.GetInt64(column_index + 6);
 
 	auto column_type = MySQLTypes::TypeToLogicalType({context}, type_info);
-	ColumnDefinition column(std::move(column_name), std::move(column_type));
+	ColumnDefinition column(Identifier(std::move(column_name)), std::move(column_type));
 	if (!default_value.empty()) {
-		auto expressions = Parser::ParseExpressionList(default_value);
+		auto expressions = Parser::GetBuiltinParser().ParseExpressionList(default_value);
 		if (expressions.empty()) {
 			throw InternalException("Expression list is empty");
 		}
@@ -86,7 +86,7 @@ static void AddStarRocksColumn(ClientContext &context, MySQLTextResult &result, 
 	auto is_nullable = result.GetString(3);
 
 	auto column_type = MySQLTypes::TypeToLogicalType({context}, type_info);
-	ColumnDefinition column(std::move(column_name), std::move(column_type));
+	ColumnDefinition column(Identifier(std::move(column_name)), std::move(column_type));
 	auto &create_info = *table_info.create_info;
 	if (!StringUtil::CIEquals(is_nullable, "YES")) {
 		auto column_idx = create_info.columns.LogicalColumnCount();
@@ -99,7 +99,7 @@ static unique_ptr<MySQLTableInfo> GetStarRocksTableInfo(ClientContext &context, 
                                                         MySQLConnection &connection, const string &table_name) {
 	auto table_info = make_uniq<MySQLTableInfo>(schema, table_name);
 	string query = "SHOW FULL COLUMNS FROM ";
-	query += MySQLUtils::WriteIdentifier(schema.name);
+	query += MySQLUtils::WriteIdentifier(schema.name.GetIdentifierName());
 	query += ".";
 	query += MySQLUtils::WriteIdentifier(table_name);
 	auto result = connection.QueryText(query);
@@ -114,7 +114,7 @@ void MySQLTableSet::LoadEntries(ClientContext &context) {
 	if (mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy()) {
 		auto acquire_mode = MySQLConnectionPool::GetAcquireMode(context);
 		auto connection = mysql_catalog.GetConnectionPool().Acquire(acquire_mode);
-		string query = "SHOW TABLES FROM " + MySQLUtils::WriteIdentifier(schema.name);
+		string query = "SHOW TABLES FROM " + MySQLUtils::WriteIdentifier(schema.name.GetIdentifierName());
 		auto result = connection.GetConnection().QueryText(query);
 		while (result->Next()) {
 			auto table_name = result->GetString(0);
@@ -131,7 +131,7 @@ FROM information_schema.columns
 WHERE table_schema=${SCHEMA_NAME}
 ORDER BY table_name, ordinal_position;
 )",
-	                                 "${SCHEMA_NAME}", MySQLUtils::WriteLiteral(schema.name));
+	                                 "${SCHEMA_NAME}", MySQLUtils::WriteLiteral(schema.name.GetIdentifierName()));
 
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	auto result = transaction.Query(query);
@@ -179,7 +179,7 @@ unique_ptr<MySQLTableInfo> MySQLTableSet::GetTableInfo(ClientContext &context, M
 	}
 
 	auto &transaction = MySQLTransaction::Get(context, schema.ParentCatalog());
-	auto query = GetTableInfoQuery(schema.name, table_name);
+	auto query = GetTableInfoQuery(schema.name.GetIdentifierName(), table_name);
 	auto result = transaction.Query(query);
 	auto table_info = make_uniq<MySQLTableInfo>(schema, table_name);
 	string selected_name;
@@ -226,7 +226,7 @@ string MySQLColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Cons
 			not_null_columns.insert(not_null.index);
 		} else if (constraint->type == ConstraintType::UNIQUE) {
 			auto &pk = constraint->Cast<UniqueConstraint>();
-			vector<string> constraint_columns = pk.columns;
+			const auto &constraint_columns = pk.columns;
 			if (pk.index.index != DConstants::INVALID_INDEX) {
 				// no columns specified: single column constraint
 				if (pk.is_primary_key) {
@@ -239,8 +239,8 @@ string MySQLColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Cons
 				// all columns
 				if (pk.is_primary_key) {
 					// multi key pk column: insert set of columns into multi_key_pks
-					for (auto &col : pk.columns) {
-						multi_key_pks.insert(col);
+					for (auto &col : constraint_columns) {
+						multi_key_pks.insert(col.GetIdentifierName());
 					}
 				}
 				extra_constraints.push_back(constraint->ToString());
@@ -260,11 +260,11 @@ string MySQLColumnsToSQL(const ColumnList &columns, const vector<unique_ptr<Cons
 		if (column.Oid() > 0) {
 			ss << ", ";
 		}
-		ss << MySQLUtils::WriteIdentifier(column.Name()) << " ";
+		ss << MySQLUtils::WriteIdentifier(column.Name().GetIdentifierName()) << " ";
 		ss << MySQLTypes::TypeToString(column.Type());
 		bool not_null = not_null_columns.find(column.Logical()) != not_null_columns.end();
 		bool is_single_key_pk = pk_columns.find(column.Logical()) != pk_columns.end();
-		bool is_multi_key_pk = multi_key_pks.find(column.Name()) != multi_key_pks.end();
+		bool is_multi_key_pk = multi_key_pks.find(column.Name().GetIdentifierName()) != multi_key_pks.end();
 		bool is_unique = unique_columns.find(column.Logical()) != unique_columns.end();
 		if (not_null && !is_single_key_pk && !is_multi_key_pk) {
 			// NOT NULL but not a primary key column
@@ -306,11 +306,12 @@ string GetMySQLCreateTable(ClientContext &context, CreateTableInfo &info) {
 	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 		ss << "IF NOT EXISTS ";
 	}
-	if (!info.schema.empty()) {
-		ss << MySQLUtils::WriteIdentifier(info.schema);
+	auto schema_name = info.GetQualifiedName().Schema().GetIdentifierName();
+	if (!schema_name.empty()) {
+		ss << MySQLUtils::WriteIdentifier(schema_name);
 		ss << ".";
 	}
-	ss << MySQLUtils::WriteIdentifier(info.table);
+	ss << MySQLUtils::WriteIdentifier(info.GetTableName().GetIdentifierName());
 	ss << MySQLColumnsToSQL(info.columns, info.constraints);
 	ss << ";";
 	return ss.str();
@@ -327,20 +328,20 @@ optional_ptr<CatalogEntry> MySQLTableSet::CreateTable(ClientContext &context, Bo
 void MySQLTableSet::AlterTable(ClientContext &context, RenameTableInfo &info) {
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	string sql = "ALTER TABLE ";
-	sql += MySQLUtils::WriteIdentifier(info.name);
+	sql += MySQLUtils::WriteIdentifier(info.GetQualifiedName().Name().GetIdentifierName());
 	sql += " RENAME TO ";
-	sql += MySQLUtils::WriteIdentifier(info.new_table_name);
+	sql += MySQLUtils::WriteIdentifier(info.new_table_name.GetIdentifierName());
 	transaction.Query(sql);
 }
 
 void MySQLTableSet::AlterTable(ClientContext &context, RenameColumnInfo &info) {
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	string sql = "ALTER TABLE ";
-	sql += MySQLUtils::WriteIdentifier(info.name);
+	sql += MySQLUtils::WriteIdentifier(info.GetQualifiedName().Name().GetIdentifierName());
 	sql += " RENAME COLUMN  ";
-	sql += MySQLUtils::WriteIdentifier(info.old_name);
+	sql += MySQLUtils::WriteIdentifier(info.old_name.GetIdentifierName());
 	sql += " TO ";
-	sql += MySQLUtils::WriteIdentifier(info.new_name);
+	sql += MySQLUtils::WriteIdentifier(info.new_name.GetIdentifierName());
 
 	transaction.Query(sql);
 }
@@ -348,12 +349,12 @@ void MySQLTableSet::AlterTable(ClientContext &context, RenameColumnInfo &info) {
 void MySQLTableSet::AlterTable(ClientContext &context, AddColumnInfo &info) {
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	string sql = "ALTER TABLE ";
-	sql += MySQLUtils::WriteIdentifier(info.name);
+	sql += MySQLUtils::WriteIdentifier(info.GetQualifiedName().Name().GetIdentifierName());
 	sql += " ADD COLUMN  ";
 	if (info.if_column_not_exists) {
 		sql += "IF NOT EXISTS ";
 	}
-	sql += MySQLUtils::WriteIdentifier(info.new_column.Name());
+	sql += MySQLUtils::WriteIdentifier(info.new_column.Name().GetIdentifierName());
 	sql += " ";
 	sql += info.new_column.Type().ToString();
 	transaction.Query(sql);
@@ -362,12 +363,12 @@ void MySQLTableSet::AlterTable(ClientContext &context, AddColumnInfo &info) {
 void MySQLTableSet::AlterTable(ClientContext &context, RemoveColumnInfo &info) {
 	auto &transaction = MySQLTransaction::Get(context, catalog);
 	string sql = "ALTER TABLE ";
-	sql += MySQLUtils::WriteIdentifier(info.name);
+	sql += MySQLUtils::WriteIdentifier(info.GetQualifiedName().Name().GetIdentifierName());
 	sql += " DROP COLUMN  ";
 	if (info.if_column_exists) {
 		throw NotImplementedException("DROP COLUMN IF EXISTS not supported in MySQL");
 	}
-	sql += MySQLUtils::WriteIdentifier(info.removed_column);
+	sql += MySQLUtils::WriteIdentifier(info.removed_column.GetIdentifierName());
 	transaction.Query(sql);
 }
 

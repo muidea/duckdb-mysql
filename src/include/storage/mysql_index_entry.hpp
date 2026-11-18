@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 
 namespace duckdb {
 
@@ -19,8 +21,8 @@ public:
 	string table_name;
 
 public:
-	string GetSchemaName() const override;
-	string GetTableName() const override;
+	Identifier GetSchemaName() const override;
+	Identifier GetTableName() const override;
 };
 
 } // namespace duckdb

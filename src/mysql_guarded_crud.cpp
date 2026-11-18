@@ -46,9 +46,9 @@ struct Data : TableFunctionData {
 };
 struct State : GlobalTableFunctionState { bool done = false; };
 static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) { return make_uniq<State>(); }
-static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types, vector<string> &names) {
+static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types, vector<Identifier> &names) {
     for (auto &v : in.inputs) if (v.IsNull()) Reject();
-    auto db = DatabaseManager::Get(ctx).GetDatabase(ctx,in.inputs[0].GetValue<string>());
+    auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(in.inputs[0].GetValue<string>()));
     if (!db || db->GetCatalog().GetCatalogType() != "mysql") Reject();
     auto data = make_uniq<Data>(db->GetCatalog().Cast<MySQLCatalog>(),in.inputs.size() == 6);
     data->schema=in.inputs[1].GetValue<string>(); data->table=in.inputs[2].GetValue<string>();
@@ -57,7 +57,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
         data->expected=in.inputs[3].GetValue<string>(); data->version=in.inputs[4].GetValue<string>(); data->sql=in.inputs[5].GetValue<string>();
         auto it=in.named_parameters.find("params"); if (it!=in.named_parameters.end()) data->params=StructValue::GetChildren(it->second);
     }
-    data->returning = in.table_function.name=="mysql_guarded_insert_returning_v1";
+    data->returning = in.table_function.GetName().GetIdentifierName()=="mysql_guarded_insert_returning_v1";
     if(data->returning) {
         auto name=in.named_parameters.find("returning_name"),oid=in.named_parameters.find("returning_oid");
         if(name==in.named_parameters.end() || oid==in.named_parameters.end() || name->second.IsNull() || oid->second.IsNull()) Reject();
@@ -453,16 +453,25 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
 }
 void RegisterMySQLGuardedCRUD(ExtensionLoader &loader) {
     TableFunction returning("mysql_guarded_insert_returning_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
-    returning.named_parameters["params"]=LogicalType::ANY;returning.named_parameters["returning_keys"]=LogicalType::ANY;
-    returning.named_parameters["returning_name"]=LogicalType::VARCHAR;returning.named_parameters["returning_oid"]=LogicalType::BIGINT;
-    returning.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
+    returning.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+        options.Add("params", LogicalType::ANY)
+               .Add("returning_keys", LogicalType::ANY)
+               .Add("returning_name", LogicalType::VARCHAR)
+               .Add("returning_oid", LogicalType::BIGINT)
+               .Add("source_diagnostics", LogicalType::BOOLEAN);
+    });
     loader.RegisterFunction(returning);
 
     TableFunction metadata("mysql_crud_metadata_v1",vector<LogicalType>(3,LogicalType::VARCHAR),Scan,Bind,Init);
-    metadata.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
+    metadata.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+        options.Add("source_diagnostics", LogicalType::BOOLEAN);
+    });
     loader.RegisterFunction(metadata);
     TableFunction exec("mysql_guarded_mutation_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
-    exec.named_parameters["source_diagnostics"]=LogicalType::BOOLEAN;
-    exec.named_parameters["params"]=LogicalType::ANY; loader.RegisterFunction(exec);
+    exec.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+        options.Add("source_diagnostics", LogicalType::BOOLEAN)
+               .Add("params", LogicalType::ANY);
+    });
+    loader.RegisterFunction(exec);
 }
 }

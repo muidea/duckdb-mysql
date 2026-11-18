@@ -7,6 +7,7 @@
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 
 #include "mysql_connection.hpp"
 #include "mysql_scanner.hpp"
@@ -68,7 +69,7 @@ vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entr
 		}
 		for (idx_t c = 0; c < column_count; c++) {
 			auto &col = columns.GetColumn(column_indexes[c]);
-			column_names.push_back(col.GetName());
+			column_names.push_back(col.GetName().GetIdentifierName());
 		}
 	}
 	return column_names;
@@ -77,9 +78,9 @@ vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entr
 string GetBaseInsertQuery(const MySQLTableEntry &table, const vector<string> &column_names) {
 	string query;
 	query += "INSERT INTO ";
-	query += MySQLUtils::WriteIdentifier(table.schema.name);
+	query += MySQLUtils::WriteIdentifier(table.schema.name.GetIdentifierName());
 	query += ".";
-	query += MySQLUtils::WriteIdentifier(table.name);
+	query += MySQLUtils::WriteIdentifier(table.name.GetIdentifierName());
 	query += " ";
 	if (!column_names.empty()) {
 		query += "(";
@@ -122,7 +123,7 @@ unique_ptr<GlobalSinkState> MySQLInsert::GetGlobalSinkState(ClientContext &conte
 static void MySQLCastBlob(const Vector &input, Vector &result, idx_t count) {
 	static constexpr const char *HEX_TABLE = "0123456789ABCDEF";
 	auto input_data = FlatVector::GetData<string_t>(input);
-	auto result_data = FlatVector::GetData<string_t>(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
 	for (idx_t r = 0; r < count; r++) {
 		if (FlatVector::IsNull(input, r)) {
 			FlatVector::SetNull(result, r, true);
@@ -268,7 +269,7 @@ string MySQLInsert::GetName() const {
 
 InsertionOrderPreservingMap<string> MySQLInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table Name"] = table ? table->name : info->Base().table;
+	result["Table Name"] = table ? table->name.GetIdentifierName() : info->Base().GetTableName().GetIdentifierName();
 	return result;
 }
 

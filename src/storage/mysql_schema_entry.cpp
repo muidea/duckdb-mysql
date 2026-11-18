@@ -28,7 +28,7 @@ MySQLTransaction &GetMySQLTransaction(CatalogTransaction transaction) {
 void MySQLSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name) {
 	DropInfo info;
 	info.type = catalog_type;
-	info.name = name;
+	info.SetName(Identifier(name));
 	info.cascade = false;
 	info.if_not_found = OnEntryNotFound::RETURN_NULL;
 	DropEntry(context, info);
@@ -36,7 +36,7 @@ void MySQLSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_
 
 optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	auto &base_info = info.Base();
-	auto table_name = base_info.table;
+	auto table_name = base_info.GetTableName().GetIdentifierName();
 	if (base_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		// CREATE OR REPLACE - drop any existing entries first (if any)
 		TryDropEntry(transaction.GetContext(), CatalogType::TABLE_ENTRY, table_name);
@@ -49,10 +49,10 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateFunction(CatalogTransaction t
 }
 
 void MySQLUnqualifyColumnRef(ParsedExpression &expr) {
-	if (expr.type == ExpressionType::COLUMN_REF) {
+	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
 		auto &colref = expr.Cast<ColumnRefExpression>();
-		auto name = std::move(colref.column_names.back());
-		colref.column_names = {std::move(name)};
+		auto name = std::move(colref.ColumnNamesMutable().back());
+		colref.ColumnNamesMutable() = {std::move(name)};
 		return;
 	}
 	ParsedExpressionIterator::EnumerateChildren(expr, MySQLUnqualifyColumnRef);
@@ -65,16 +65,16 @@ string GetMySQLCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
 		sql += " UNIQUE";
 	}
 	sql += " INDEX ";
-	sql += MySQLUtils::WriteIdentifier(info.index_name);
+	sql += MySQLUtils::WriteIdentifier(info.GetIndexName().GetIdentifierName());
 	sql += " ON ";
-	sql += MySQLUtils::WriteIdentifier(tbl.name);
+	sql += MySQLUtils::WriteIdentifier(tbl.name.GetIdentifierName());
 	sql += "(";
 	for (idx_t i = 0; i < info.parsed_expressions.size(); i++) {
 		if (i > 0) {
 			sql += ", ";
 		}
 		MySQLUnqualifyColumnRef(*info.parsed_expressions[i]);
-		if (info.parsed_expressions[i]->type == ExpressionType::COLUMN_REF) {
+		if (info.parsed_expressions[i]->GetExpressionType() == ExpressionType::COLUMN_REF) {
 			// index on column
 			sql += info.parsed_expressions[i]->ToString();
 		} else {
@@ -97,7 +97,7 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateIndex(CatalogTransaction tran
 string GetMySQLCreateView(CreateViewInfo &info) {
 	string sql;
 	sql = "CREATE VIEW ";
-	sql += MySQLUtils::WriteIdentifier(info.view_name);
+	sql += MySQLUtils::WriteIdentifier(info.GetViewName().GetIdentifierName());
 	sql += " ";
 	if (!info.aliases.empty()) {
 		sql += "(";
@@ -106,7 +106,7 @@ string GetMySQLCreateView(CreateViewInfo &info) {
 				sql += ", ";
 			}
 			auto &alias = info.aliases[i];
-			sql += MySQLUtils::WriteIdentifier(alias);
+			sql += MySQLUtils::WriteIdentifier(alias.GetIdentifierName());
 		}
 		sql += ") ";
 	}
@@ -120,20 +120,21 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateView(CatalogTransaction trans
 		throw BinderException("Cannot create view in MySQL that originated from an "
 		                      "empty SQL statement");
 	}
+	auto view_name = info.GetViewName().GetIdentifierName();
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT ||
 	    info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
-		auto current_entry = GetEntry(transaction, CatalogType::VIEW_ENTRY, info.view_name);
+		auto current_entry = GetEntry(transaction, CatalogType::VIEW_ENTRY, info.GetViewName());
 		if (current_entry) {
 			if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 				return current_entry;
 			}
 			// CREATE OR REPLACE - drop any existing entries first (if any)
-			TryDropEntry(transaction.GetContext(), CatalogType::VIEW_ENTRY, info.view_name);
+			TryDropEntry(transaction.GetContext(), CatalogType::VIEW_ENTRY, view_name);
 		}
 	}
 	auto &mysql_transaction = GetMySQLTransaction(transaction);
 	mysql_transaction.Query(GetMySQLCreateView(info));
-	return tables.RefreshTable(transaction.GetContext(), info.view_name);
+	return tables.RefreshTable(transaction.GetContext(), view_name);
 }
 
 optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {

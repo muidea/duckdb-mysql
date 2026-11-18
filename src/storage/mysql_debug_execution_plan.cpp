@@ -14,7 +14,7 @@ struct DebugExecutionPlanData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> DebugExecutionPlanBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<DebugExecutionPlanData>();
 
 	auto databases = DatabaseManager::Get(context).GetDatabases(context);
@@ -27,7 +27,7 @@ static unique_ptr<FunctionData> DebugExecutionPlanBind(ClientContext &context, T
 		auto &mysql_catalog = catalog.Cast<MySQLCatalog>();
 		auto entries = mysql_catalog.GetPlanCache().GetPlanCacheEntries();
 		for (auto &entry : entries) {
-			result->database_names.push_back(db.GetName());
+			result->database_names.push_back(db.GetName().GetIdentifierName());
 			result->entries.push_back(std::move(entry));
 		}
 	}

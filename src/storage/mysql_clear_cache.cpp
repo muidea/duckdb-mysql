@@ -23,7 +23,7 @@ static unique_ptr<GlobalTableFunctionState> ClearCacheInit(ClientContext &, Tabl
 }
 
 static unique_ptr<FunctionData> ClearCacheBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 
 	auto result = make_uniq<ClearCacheFunctionData>();
 	if (!input.inputs.empty()) {
@@ -31,7 +31,7 @@ static unique_ptr<FunctionData> ClearCacheBind(ClientContext &context, TableFunc
 			throw InvalidInputException("scoped cache retirement requires a catalog");
 		}
 		result->catalog = input.inputs[0].GetValue<string>();
-		auto &catalog = Catalog::GetCatalog(context, result->catalog);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(result->catalog));
 		if (catalog.GetCatalogType() != "mysql") {
 			throw InvalidInputException("scoped cache retirement catalog type mismatch");
 		}
@@ -68,7 +68,7 @@ static void ClearCacheFunction(ClientContext &context, TableFunctionInput &data_
 		// Resolve one existing attachment only; never enumerate schemas or
 		// retire another source's caches. Catalog scope conservatively covers
 		// FK dependencies and prefetched schema result slices.
-		auto &catalog = Catalog::GetCatalog(context, data.catalog);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(data.catalog));
 		if (catalog.GetCatalogType() != "mysql") {
 			throw InvalidInputException("scoped cache retirement catalog type changed");
 		}

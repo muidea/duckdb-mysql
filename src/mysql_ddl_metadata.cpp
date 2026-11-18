@@ -21,11 +21,11 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
 	return make_uniq<DDLMetadataState>();
 }
 static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	for (auto &v : in.inputs)
 		if (v.IsNull())
 			throw BinderException("DDL metadata input is incomplete");
-	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, in.inputs[0].GetValue<string>());
+	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(in.inputs[0].GetValue<string>()));
 	if (!db || db->GetCatalog().GetCatalogType() != "mysql")
 		throw BinderException("DDL metadata catalog is unavailable");
 	auto d = make_uniq<DDLMetadataData>(db->GetCatalog().Cast<MySQLCatalog>(), in.inputs.size() == 4);

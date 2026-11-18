@@ -23,9 +23,9 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
 	return make_uniq<State>();
 }
 static unique_ptr<FunctionData> BindContract(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                             vector<string> &names, int32_t contract) {
+                                             vector<Identifier> &names, int32_t contract) {
 	auto intent = GuardedDDLIntent::Bind(in.inputs, true, contract);
-	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, GuardedDDLIntent::Text(in.inputs[0]));
+	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(GuardedDDLIntent::Text(in.inputs[0])));
 	if (!db || db->GetCatalog().GetCatalogType() != "mysql")
 		throw BinderException("DDL catalog is unavailable");
 	names = {"operation_id", "status", "sqlstate", "stage", "warning_count"};
@@ -38,19 +38,19 @@ static unique_ptr<FunctionData> BindContract(ClientContext &ctx, TableFunctionBi
     return std::move(data);
 }
 static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	return BindContract(ctx, in, types, names, 2);
 }
 static unique_ptr<FunctionData> BindV3(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
 	return BindContract(ctx, in, types, names, 3);
 }
 static unique_ptr<FunctionData> BindV4(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
 	return BindContract(ctx, in, types, names, 4);
 }
 static unique_ptr<FunctionData> BindV5(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
 	return BindContract(ctx, in, types, names, 5);
 }
 static string Scalar(MYSQL *raw, const string &sql) {
@@ -457,7 +457,12 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 }
 } // namespace
 void RegisterMySQLGuardedDDL(ExtensionLoader &loader) {
-  auto register_function = [&](TableFunction function) {function.named_parameters["source_diagnostics"]=LogicalType::BOOLEAN;loader.RegisterFunction(function);};
+  auto register_function = [&](TableFunction function) {
+	  function.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		  options.Add("source_diagnostics", LogicalType::BOOLEAN);
+	  });
+	  loader.RegisterFunction(function);
+  };
   register_function(TableFunction(
 	  "mysql_guarded_ddl_v5",
 	  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}, Scan,

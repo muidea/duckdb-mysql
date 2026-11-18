@@ -9,8 +9,8 @@
 #pragma once
 
 #include "duckdb/planner/table_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 
 namespace duckdb {
 
@@ -20,9 +20,9 @@ public:
 	                               const vector<string> &names);
 
 	static string TransformFilter(string &column_name, TableFilter &filter);
+	static string TransformComparison(ExpressionType type);
 
 private:
-	static string TransformComparison(ExpressionType type);
 	static string CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op);
 };
 

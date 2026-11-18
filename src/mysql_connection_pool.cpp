@@ -162,7 +162,7 @@ void MySQLConnectionPool::CalibrateNetwork(MySQLConnection &conn) {
 
 static idx_t ReadUBigIntOption(ClientContext &ctx, const std::string &name, idx_t default_val) {
 	Value val;
-	if (ctx.TryGetCurrentSetting(name, val)) {
+	if (ctx.TryGetCurrentSetting(Identifier(name), val)) {
 		return UBigIntValue::Get(val);
 	}
 	return default_val;
@@ -170,7 +170,7 @@ static idx_t ReadUBigIntOption(ClientContext &ctx, const std::string &name, idx_
 
 static bool ReadBooleanOption(ClientContext &ctx, const std::string &name, bool default_val) {
 	Value val;
-	if (ctx.TryGetCurrentSetting(name, val)) {
+	if (ctx.TryGetCurrentSetting(Identifier(name), val)) {
 		return BooleanValue::Get(val);
 	}
 	return default_val;
@@ -179,7 +179,7 @@ static bool ReadBooleanOption(ClientContext &ctx, const std::string &name, bool 
 static dbconnector::pool::AcquireMode ReadAcquireModeOption(ClientContext &ctx, const std::string &name,
                                                             dbconnector::pool::AcquireMode default_val) {
 	Value val;
-	if (ctx.TryGetCurrentSetting(name, val)) {
+	if (ctx.TryGetCurrentSetting(Identifier(name), val)) {
 		return dbconnector::pool::AcquireModeHelpers::FromString(StringUtil::Lower(val.ToString()));
 	}
 	return default_val;
