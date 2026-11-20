@@ -14,7 +14,7 @@
 namespace duckdb {
 struct CreateTableInfo;
 class MySQLConnection;
-class MySQLResult;
+class MySQLResultReader;
 class MySQLSchemaEntry;
 
 class MySQLTableSet : public MySQLInSchemaSet {
@@ -38,7 +38,7 @@ protected:
 	void AlterTable(ClientContext &context, AddColumnInfo &info);
 	void AlterTable(ClientContext &context, RemoveColumnInfo &info);
 
-	static void AddColumn(ClientContext &context, MySQLResult &result, MySQLTableInfo &table_info,
+	static void AddColumn(ClientContext &context, MySQLResultReader &result, MySQLTableInfo &table_info,
 	                      idx_t column_offset = 0);
 };
 

@@ -379,7 +379,7 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 
 	FederationState fed;
 	auto &mysql_catalog = bind_data.table.catalog.Cast<MySQLCatalog>();
-	auto use_text_protocol = mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy();
+	auto use_text_protocol = !mysql_catalog.GetBackendCapabilities().supports_prepared_statement;
 
 	if (bind_data.has_aggregate_pushdown) {
 		auto scan_streaming = ResolveScanStreaming(bind_data);
@@ -698,10 +698,10 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 	}
 
 	auto &mysql_catalog = catalog.Cast<MySQLCatalog>();
-	if (mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy()) {
+	if (!mysql_catalog.GetBackendCapabilities().supports_prepared_statement) {
 		if (!params.empty()) {
-			throw BinderException("mysql_query parameters are not supported for StarRocks legacy MySQL protocol "
-			                      "because prepared statements are disabled for this backend");
+			throw BinderException("mysql_query parameters are not supported for this backend "
+			                      "because prepared statements are unsupported");
 		}
 		auto acquire_mode = MySQLConnectionPool::GetAcquireMode(context);
 		std::string time_zone;

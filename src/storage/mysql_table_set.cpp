@@ -21,7 +21,7 @@ namespace duckdb {
 MySQLTableSet::MySQLTableSet(MySQLSchemaEntry &schema) : MySQLInSchemaSet(schema) {
 }
 
-void MySQLTableSet::AddColumn(ClientContext &context, MySQLResult &result, MySQLTableInfo &table_info,
+void MySQLTableSet::AddColumn(ClientContext &context, MySQLResultReader &result, MySQLTableInfo &table_info,
                               idx_t column_offset) {
 	MySQLTypeData type_info;
 	idx_t column_index = column_offset;
@@ -69,6 +69,9 @@ static void ParseStarRocksType(const string &raw_type, MySQLTypeData &type_info)
 	try {
 		if (comma == string::npos) {
 			type_info.precision = std::stoll(args);
+			if (StringUtil::StartsWith(type_info.type_name, "decimal")) {
+				type_info.scale = 0;
+			}
 		} else {
 			type_info.precision = std::stoll(args.substr(0, comma));
 			type_info.scale = std::stoll(args.substr(comma + 1));
