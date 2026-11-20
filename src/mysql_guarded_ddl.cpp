@@ -39,19 +39,20 @@ static unique_ptr<FunctionData> BindContract(ClientContext &ctx, TableFunctionBi
 }
 static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
                                      vector<Identifier> &names) {
-	return BindContract(ctx, in, types, names, 2);
-}
-static unique_ptr<FunctionData> BindV3(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                       vector<Identifier> &names) {
-	return BindContract(ctx, in, types, names, 3);
-}
-static unique_ptr<FunctionData> BindV4(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                       vector<Identifier> &names) {
-	return BindContract(ctx, in, types, names, 4);
-}
-static unique_ptr<FunctionData> BindV5(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                       vector<Identifier> &names) {
-	return BindContract(ctx, in, types, names, 5);
+	if (in.inputs.size() != 5 || in.inputs[4].IsNull() || in.inputs[4].type().id() != LogicalTypeId::STRUCT) {
+		throw BinderException("DDL structured input is invalid");
+	}
+	const auto &st = StructType::GetChildTypes(in.inputs[4].type());
+	const auto &sf = StructValue::GetChildren(in.inputs[4]);
+	if (st.empty() || st[0].first != "contract_version" || sf[0].IsNull() ||
+	    sf[0].type().id() != LogicalTypeId::INTEGER) {
+		throw BinderException("DDL contract is unavailable");
+	}
+	const int32_t contract = sf[0].GetValue<int32_t>();
+	if (contract < 2 || contract > 5) {
+		throw BinderException("DDL contract is unavailable");
+	}
+	return BindContract(ctx, in, types, names, contract);
 }
 static string Scalar(MYSQL *raw, const string &sql) {
 	if (mysql_real_query(raw, sql.c_str(), sql.size()))
@@ -464,20 +465,8 @@ void RegisterMySQLGuardedDDL(ExtensionLoader &loader) {
 	  loader.RegisterFunction(function);
   };
   register_function(TableFunction(
-	  "mysql_guarded_ddl_v5",
+	  "mysql_guarded_ddl",
 	  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}, Scan,
-	  BindV5, Init));
-	register_function(TableFunction(
-	    "mysql_guarded_ddl_v2",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-	    Scan, Bind, Init));
-	register_function(TableFunction(
-	    "mysql_guarded_ddl_v3",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-	    Scan, BindV3, Init));
-	register_function(TableFunction(
-	    "mysql_guarded_ddl_v4",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
-	    Scan, BindV4, Init));
+	  Bind, Init));
 }
 } // namespace duckdb

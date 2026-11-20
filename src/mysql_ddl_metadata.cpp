@@ -256,8 +256,8 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 } // namespace
 void RegisterMySQLDDLMetadata(ExtensionLoader &loader) {
 	loader.RegisterFunction(
-	    TableFunction("mysql_ddl_capabilities_v1", vector<LogicalType>(2, LogicalType::VARCHAR), Scan, Bind, Init));
+	    TableFunction("mysql_ddl_capabilities", vector<LogicalType>(2, LogicalType::VARCHAR), Scan, Bind, Init));
 	loader.RegisterFunction(
-	    TableFunction("mysql_ddl_describe_v1", vector<LogicalType>(4, LogicalType::VARCHAR), Scan, Bind, Init));
+	    TableFunction("mysql_ddl_describe", vector<LogicalType>(4, LogicalType::VARCHAR), Scan, Bind, Init));
 }
 } // namespace duckdb

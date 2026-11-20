@@ -57,7 +57,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
         data->expected=in.inputs[3].GetValue<string>(); data->version=in.inputs[4].GetValue<string>(); data->sql=in.inputs[5].GetValue<string>();
         auto it=in.named_parameters.find("params"); if (it!=in.named_parameters.end()) data->params=StructValue::GetChildren(it->second);
     }
-    data->returning = in.table_function.GetName().GetIdentifierName()=="mysql_guarded_insert_returning_v1";
+    data->returning = in.table_function.GetName().GetIdentifierName()=="mysql_guarded_insert_returning";
     if(data->returning) {
         auto name=in.named_parameters.find("returning_name"),oid=in.named_parameters.find("returning_oid");
         if(name==in.named_parameters.end() || oid==in.named_parameters.end() || name->second.IsNull() || oid->second.IsNull()) Reject();
@@ -452,7 +452,7 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
 }
 }
 void RegisterMySQLGuardedCRUD(ExtensionLoader &loader) {
-    TableFunction returning("mysql_guarded_insert_returning_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
+    TableFunction returning("mysql_guarded_insert_returning",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
     returning.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
         options.Add("params", LogicalType::ANY)
                .Add("returning_keys", LogicalType::ANY)
@@ -462,12 +462,12 @@ void RegisterMySQLGuardedCRUD(ExtensionLoader &loader) {
     });
     loader.RegisterFunction(returning);
 
-    TableFunction metadata("mysql_crud_metadata_v1",vector<LogicalType>(3,LogicalType::VARCHAR),Scan,Bind,Init);
+    TableFunction metadata("mysql_crud_metadata",vector<LogicalType>(3,LogicalType::VARCHAR),Scan,Bind,Init);
     metadata.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
         options.Add("source_diagnostics", LogicalType::BOOLEAN);
     });
     loader.RegisterFunction(metadata);
-    TableFunction exec("mysql_guarded_mutation_v1",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
+    TableFunction exec("mysql_guarded_mutation",vector<LogicalType>(6,LogicalType::VARCHAR),Scan,Bind,Init);
     exec.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
         options.Add("source_diagnostics", LogicalType::BOOLEAN)
                .Add("params", LogicalType::ANY);

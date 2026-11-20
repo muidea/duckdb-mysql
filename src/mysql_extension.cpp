@@ -238,10 +238,10 @@ static void LoadInternal(ExtensionLoader &loader) {
     RegisterMySQLGuardedDDL(loader);
 #endif
 	mysql_library_init(0, NULL, NULL);
-	MySQLClearCacheFunction clear_cache_func;
-	loader.RegisterFunction(clear_cache_func);
-	MySQLClearCacheFunction scoped_clear_cache_func(true);
-	loader.RegisterFunction(scoped_clear_cache_func);
+	TableFunctionSet clear_cache_set("mysql_clear_cache");
+	clear_cache_set.AddFunction(MySQLClearCacheFunction(false));
+	clear_cache_set.AddFunction(MySQLClearCacheFunction(true));
+	loader.RegisterFunction(clear_cache_set);
 
 	MySQLExecuteFunction execute_function;
 	loader.RegisterFunction(execute_function);

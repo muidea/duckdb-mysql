@@ -261,7 +261,8 @@ MySQLBackendCapabilities MySQLConnection::DetectBackendCapabilities() {
 
 	bool starrocks_version_text = IsStarRocksVersion(caps.version) || IsStarRocksVersion(caps.version_comment) ||
 	                              IsStarRocksVersion(current_version);
-	if (starrocks_version_text || starrocks_show_frontends || starrocks_port_hint) {
+	if (starrocks_version_text || starrocks_show_frontends || starrocks_port_hint || !current_version.empty()) {
+		caps.supports_transactions = false;
 		auto starrocks_major =
 		    !current_version.empty() ? ParseMajorVersion(current_version) : ParseMajorVersion(caps.version);
 		if (starrocks_port_hint || starrocks_show_frontends || (starrocks_major >= 0 && starrocks_major < 3)) {

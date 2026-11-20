@@ -56,6 +56,7 @@ struct MySQLBackendCapabilities {
 	bool supports_prepared_statement = true;
 	bool supports_information_schema_schemata = true;
 	bool supports_text_protocol_result = true;
+	bool supports_transactions = true;
 
 	bool IsStarRocksLegacy() const {
 		return kind == MySQLBackendKind::STARROCKS_LEGACY;

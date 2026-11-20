@@ -14,9 +14,14 @@ MySQLTransaction::MySQLTransaction(MySQLCatalog &mysql_catalog, TransactionManag
     : Transaction(manager, context), catalog(mysql_catalog),
       transaction_state(MySQLTransactionState::TRANSACTION_NOT_YET_STARTED), access_mode(mysql_catalog.access_mode) {
 
-	Value mysql_enable_transactions;
-	if (context.TryGetCurrentSetting("mysql_enable_transactions", mysql_enable_transactions)) {
-		this->transactions_enabled = BooleanValue::Get(mysql_enable_transactions);
+	const auto &caps = mysql_catalog.GetBackendCapabilities();
+	if (caps.IsStarRocksLegacy() || !caps.supports_transactions) {
+		this->transactions_enabled = false;
+	} else {
+		Value mysql_enable_transactions;
+		if (context.TryGetCurrentSetting("mysql_enable_transactions", mysql_enable_transactions)) {
+			this->transactions_enabled = BooleanValue::Get(mysql_enable_transactions);
+		}
 	}
 
 	Value mysql_session_time_zone;

@@ -82,7 +82,7 @@ void MySQLClearCacheFunction::ClearCacheOnSetting(ClientContext &context, SetSco
 }
 
 MySQLClearCacheFunction::MySQLClearCacheFunction(bool scoped)
-    : TableFunction(scoped ? "mysql_clear_cache_scoped_v1" : "mysql_clear_cache",
+    : TableFunction("mysql_clear_cache",
                     scoped ? vector<LogicalType>{LogicalType::VARCHAR} : vector<LogicalType>{},
                     ClearCacheFunction, ClearCacheBind, ClearCacheInit) {
 }
