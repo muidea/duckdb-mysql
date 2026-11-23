@@ -132,7 +132,7 @@ DataChunk &MySQLResult::NextChunk() {
 		WriteToChunk(r);
 	}
 
-	this->data_chunk.SetCardinality(r);
+	this->data_chunk.SetChildCardinality(r);
 	return this->data_chunk;
 }
 
@@ -325,7 +325,7 @@ DataChunk &MySQLTextResult::NextChunk() {
 
 	if (!result) {
 		exhausted = true;
-		data_chunk.SetCardinality(0);
+		data_chunk.SetChildCardinality(0);
 		return data_chunk;
 	}
 
@@ -361,7 +361,7 @@ DataChunk &MySQLTextResult::NextChunk() {
 		}
 	}
 
-	data_chunk.SetCardinality(r);
+	data_chunk.SetChildCardinality(r);
 	return data_chunk;
 }
 

@@ -587,7 +587,7 @@ static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChun
 				                                                  gstate.cache_generation);
 				gstate.feedback_submitted = true;
 			}
-			output.SetCardinality(0);
+			output.SetChildCardinality(0);
 			return;
 		}
 
@@ -614,10 +614,22 @@ static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChun
 			case LogicalTypeId::DATE:
 			case LogicalTypeId::TIME:
 			case LogicalTypeId::TIMESTAMP: {
-				if (output_vec.GetType().id() == res_vec.GetType().id() ||
-				    (output_vec.GetType().id() == LogicalTypeId::BLOB &&
-				     res_vec.GetType().id() == LogicalTypeId::VARCHAR)) {
-					output_vec.Reinterpret(res_vec);
+				if (output_vec.GetType() == res_vec.GetType()) {
+					VectorOperations::Copy(res_vec, output_vec, res_chunk.size(), 0, 0);
+				} else if (output_vec.GetType().id() == LogicalTypeId::BLOB &&
+				           res_vec.GetType().id() == LogicalTypeId::VARCHAR) {
+					res_vec.Flatten();
+					auto src_data = FlatVector::GetData<string_t>(res_vec);
+					auto &src_validity = FlatVector::Validity(res_vec);
+					auto dst_data = FlatVector::GetDataMutable<string_t>(output_vec);
+					auto &dst_validity = FlatVector::ValidityMutable(output_vec);
+					for (idx_t row = 0; row < res_chunk.size(); row++) {
+						if (!src_validity.RowIsValid(row)) {
+							dst_validity.SetInvalid(row);
+						} else {
+							dst_data[row] = StringVector::AddStringOrBlob(output_vec, src_data[row]);
+						}
+					}
 				} else {
 					VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
 				}
@@ -632,18 +644,18 @@ static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChun
 				throw BinderException(error);
 			}
 		}
-		output.SetCardinality(res_chunk.size());
+		output.SetChildCardinality(res_chunk.size());
 
 		if (gstate.local_filter_executor) {
 			SelectionVector sel(output.size());
 			idx_t result_count = gstate.local_filter_executor->SelectExpression(output, sel);
 			if (result_count == 0) {
-				output.SetCardinality(0);
+				output.SetChildCardinality(0);
 				continue;
 			}
 			if (result_count < output.size()) {
 				output.Slice(sel, result_count);
-				output.SetCardinality(result_count);
+				output.SetChildCardinality(result_count);
 			}
 			return;
 		} else {
