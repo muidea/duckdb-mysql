@@ -159,9 +159,11 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 	} else if (type_info.type_name == "datetime" || type_info.type_name == "datetimev2") {
 		return LogicalType::TIMESTAMP;
 	} else if (type_info.type_name == "decimal" || type_info.type_name == "decimalv2" ||
+	           type_info.type_name == "decimalv3" ||
 	           type_info.type_name == "decimal32" || type_info.type_name == "decimal64" ||
-	           type_info.type_name == "decimal128") {
-		if (type_info.precision > 0 && type_info.precision <= 38) {
+	           type_info.type_name == "decimal128" || type_info.type_name == "decimal256") {
+		if (type_info.precision > 0 && type_info.precision <= 38 &&
+		    type_info.scale >= 0 && type_info.scale <= type_info.precision) {
 			return LogicalType::DECIMAL(type_info.precision, type_info.scale);
 		}
 		// DuckDB DECIMAL stops at 38 digits. Preserve the source's decimal
@@ -172,7 +174,10 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 			    .WithAlias("MYSQL_DECIMAL(" + std::to_string(type_info.precision) + "," +
 			               std::to_string(type_info.scale) + ")");
 		}
-		throw NotImplementedException("MySQL decimal precision/scale cannot be represented losslessly");
+		// Wider decimals (e.g. precision > 65 or scale > 30) or decimal columns/views
+		// with missing/non-standard typmod cannot fit DECIMAL/MYSQL_DECIMAL; preserve
+		// exact text in VARCHAR rather than aborting catalog scans or rounding.
+		return LogicalType::VARCHAR;
 	} else if (type_info.type_name == "boolean") {
 		return LogicalType::BOOLEAN;
 	} else if (type_info.type_name == "json") {

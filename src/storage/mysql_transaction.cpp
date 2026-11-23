@@ -93,8 +93,20 @@ MySQLConnection &MySQLTransaction::GetConnection() {
 	return pooled_connection.GetConnection();
 }
 
-unique_ptr<MySQLResult> MySQLTransaction::Query(const string &query) {
+unique_ptr<MySQLResultReader> MySQLTransaction::Query(const string &query) {
 	EnsureConnection();
+	auto &con = pooled_connection.GetConnection();
+	auto ctx = context.lock();
+	if (ctx) {
+		con.SetTypeConfig(MySQLTypeConfig(*ctx));
+	}
+
+	auto run_query = [&]() -> unique_ptr<MySQLResultReader> {
+		if (!catalog.GetBackendCapabilities().supports_prepared_statement) {
+			return con.QueryText(query);
+		}
+		return con.Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
+	};
 
 	if (transactions_enabled && transaction_state == MySQLTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = MySQLTransactionState::TRANSACTION_STARTED;
@@ -103,15 +115,15 @@ unique_ptr<MySQLResult> MySQLTransaction::Query(const string &query) {
 			transaction_start += " READ ONLY";
 		}
 		try {
-			pooled_connection.GetConnection().Execute(transaction_start);
-			return pooled_connection.GetConnection().Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
+			con.Execute(transaction_start);
+			return run_query();
 		} catch (...) {
 			pooled_connection.Invalidate();
 			throw;
 		}
 	}
 	try {
-		return pooled_connection.GetConnection().Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
+		return run_query();
 	} catch (...) {
 		pooled_connection.Invalidate();
 		throw;

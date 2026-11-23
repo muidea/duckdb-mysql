@@ -37,6 +37,36 @@ int main() {
 		}
 	}
 	std::cout << "decimal catalog/query precision tests passed\n";
+	// Out-of-range/unbounded decimals must preserve exact text in VARCHAR without
+	// failing catalog scans or falsely claiming MYSQL_DECIMAL(39..65,0..30) status.
+	for (const auto &wide_fallback : vector<MySQLTypeData> {
+	         {"decimal", "decimal(66,0)", 66, 0},
+	         {"decimal", "decimal(40,35)", 40, 35},
+	         {"decimalv3", "decimalv3(76,38)", 76, 38},
+	         {"decimal", "decimal", -1, -1},
+	         MySQLTypeData{"decimal", "decimal"},
+	         {"decimal", "decimal(10)", 10, -1}}) {
+		auto fallback_type = MySQLTypes::TypeToLogicalType(config, wide_fallback);
+		Require(fallback_type == LogicalType::VARCHAR);
+		Require(fallback_type.GetAlias().empty());
+	}
+	auto v3_small = MySQLTypes::TypeToLogicalType(config, {"decimalv3", "decimalv3(18,4)", 18, 4});
+	Require(v3_small == LogicalType::DECIMAL(18, 4));
+	MYSQL_FIELD wide_decimal_field {};
+	wide_decimal_field.type = MYSQL_TYPE_NEWDECIMAL;
+	wide_decimal_field.decimals = 32;
+	wide_decimal_field.flags = NUM_FLAG;
+	wide_decimal_field.length = 80;
+	Require(MySQLTypes::FieldToLogicalType(config, &wide_decimal_field) == LogicalType::VARCHAR);
+	MYSQL_FIELD zero_decimal_field {};
+	zero_decimal_field.type = MYSQL_TYPE_DECIMAL;
+	zero_decimal_field.flags = NUM_FLAG;
+	zero_decimal_field.length = 0;
+	Require(MySQLTypes::FieldToLogicalType(config, &zero_decimal_field) == LogicalType::VARCHAR);
+	const string ultra_wide = "12345678901234567890123456789012345.12345678901234567890123456789012345";
+	Require(MySQLTypes::DecodeTextValue(config, LogicalType::VARCHAR, MYSQL_TYPE_NEWDECIMAL, ultra_wide.data(),
+	                                    ultra_wide.size())
+	            .ToString() == ultra_wide);
 	auto decode = [&](const LogicalType &type, const string &text, enum_field_types mysql_type = MYSQL_TYPE_VAR_STRING) {
 		return MySQLTypes::DecodeTextValue(config, type, mysql_type, text.data(), text.size());
 	};

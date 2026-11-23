@@ -17,7 +17,7 @@ def encoded(value):
 
 
 def column(name):
-    kind = 8 if name in ('numeric_precision', 'numeric_scale', 'one') else 253
+    kind = 8 if name in ('numeric_precision', 'numeric_scale', 'one', 'canonical_id') else 253
     return b''.join(encoded(s) for s in ('def', 'fixture', '', '', name, name)) + b'\x0c' + struct.pack('<HIBHB', 33, 1024, kind, 0, 0) + b'\0\0'
 
 
@@ -29,11 +29,13 @@ class Fixture(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self):
+    def __init__(self, reject_prepare=False):
         super().__init__(('127.0.0.1', 0), Handler)
+        self.reject_prepare = reject_prepare
         self.queries = []
+        self.prepared_queries = []
         self.errors = []
-        self.tables = {'Mixed': ['canonical_id', 'label'], 'other': ['other_id']}
+        self.tables = {'Mixed': ['canonical_id', 'label', 'wide_dec'], 'other': ['other_id']}
 
     def handle_error(self, request, client_address):
         self.errors.append(repr(sys.exc_info()[1]))
@@ -45,17 +47,28 @@ class Fixture(socketserver.ThreadingTCPServer):
             return [], []
         if 'information_schema.schemata' in q:
             return ['schema_name'], [['fixture']]
-        if 'information_schema.columns' in q:
+        if 'information_schema.columns' in q.lower():
             match = re.search(r"table_name='([^']+)'", q)
             names = [n for n in sorted(self.tables) if not match or n.lower() == match[1].lower()]
             rows = []
             for name in names:
                 for col in self.tables[name]:
-                    row = [col, 'int', 'int(11)', None, 'NO', '10', '0']
+                    if col == 'wide_dec':
+                        row = [col, 'decimal', 'decimal(66,4)', None, 'YES', '66', '4']
+                    elif col == 'label':
+                        row = [col, 'varchar', 'varchar(64)', None, 'YES', None, None]
+                    elif col == 'canonical_id':
+                        row = [col, 'bigint', 'bigint(20)', None, 'NO', '19', '0']
+                    else:
+                        row = [col, 'int', 'int(11)', None, 'NO', '10', '0']
                     rows.append(row + [name] if match else [name] + row)
             names = ['column_name', 'data_type', 'column_type', 'column_default', 'is_nullable', 'numeric_precision', 'numeric_scale']
             return names + ['table_name'] if match else ['table_name'] + names, rows
-        if q.upper() == 'SELECT 1':
+        if 'information_schema.statistics' in q.lower():
+            return ['TABLE_NAME', 'INDEX_NAME'], [['Mixed', 'idx_mixed_canonical']] if "table_schema = 'fixture'" in q.lower() else []
+        if 'from `fixture`.`mixed`' in q.lower() or 'from `mixed`' in q.lower():
+            return ['canonical_id', 'label', 'wide_dec'], [[1, 'ok', '12345.6789']]
+        if q.upper() in ('SELECT 1', 'SELECT 1 AS ONE') or '__duckdb_mysql_query' in q:
             return ['one'], [[1]]
         if q == "SELECT REPEAT('x', 65536)":
             return ['payload'], [['x'*65536]]
@@ -101,7 +114,7 @@ class Handler(socketserver.BaseRequestHandler):
                     if value is None:
                         bitmap[(i+2)//8] |= 1 << ((i+2)%8)
                     else:
-                        payload += struct.pack('<q', int(value)) if names[i] in ('numeric_precision', 'numeric_scale', 'one') else encoded(value)
+                        payload += struct.pack('<q', int(value)) if names[i] in ('numeric_precision', 'numeric_scale', 'one', 'canonical_id') else encoded(value)
                 payload = b'\0' + bytes(bitmap) + payload
             else:
                 payload = b''.join(b'\xfb' if v is None else encoded(v) for v in row)
@@ -130,7 +143,12 @@ class Handler(socketserver.BaseRequestHandler):
                     else:
                         self.rows(*self.server.query(payload[1:].decode()))
                 elif command == 22:
-                    names, rows = self.server.query(payload[1:].decode())
+                    stmt_sql = payload[1:].decode()
+                    self.server.prepared_queries.append(stmt_sql)
+                    if self.server.reject_prepare:
+                        self.send(b'\xff' + struct.pack('<H', 1047) + b'#08S01Unsupported command(COM_STMT_PREPARE)', 1)
+                        continue
+                    names, rows = self.server.query(stmt_sql)
                     sid = len(statements)+1
                     statements[sid] = names, rows
                     self.send(b'\0' + struct.pack('<IHHBH', sid, len(names), 0, 0, 0), 1)
@@ -151,8 +169,8 @@ class Handler(socketserver.BaseRequestHandler):
             pass
 
 
-def main():
-    fixture = Fixture()
+def run_case(reject_prepare):
+    fixture = Fixture(reject_prepare=reject_prepare)
     threading.Thread(target=fixture.serve_forever, daemon=True).start()
     sql = "LOAD '%s'; ATTACH 'host=127.0.0.1 port=%d user=fixture database=fixture' AS src (TYPE mysql, READ_ONLY);" % (sys.argv[2], fixture.server_address[1])
     sql += '''
@@ -160,24 +178,40 @@ DESCRIBE SELECT * FROM src.fixture.mIXED;
 DESCRIBE SELECT * FROM src.fixture.Mixed;
 DESCRIBE SELECT * FROM src.fixture.other;
 SELECT count(*) FROM duckdb_tables() WHERE database_name='src' AND schema_name='fixture';
+SELECT index_name FROM duckdb_indexes() WHERE database_name='src' AND schema_name='fixture';
+SELECT * FROM src.fixture.Mixed;
+SELECT * FROM mysql_query('src', 'SELECT 1 AS one');
 DESCRIBE SELECT * FROM src.fixture.missing;
 '''
     try:
         run = subprocess.run([sys.argv[1], '-unsigned', '-csv', '-noheader'], input=sql, capture_output=True, text=True, timeout=60)
-        assert 'canonical_id,INTEGER' in run.stdout and 'other_id,INTEGER' in run.stdout, (run.returncode, run.stdout, run.stderr)
+        assert 'canonical_id,BIGINT' in run.stdout and 'label,VARCHAR' in run.stdout and 'wide_dec,VARCHAR' in run.stdout and 'other_id,INTEGER' in run.stdout, (run.returncode, run.stdout, run.stderr)
+        assert 'idx_mixed_canonical' in run.stdout, run.stdout
+        assert '1,ok,12345.6789' in run.stdout, run.stdout
         assert '\n2\n' in run.stdout, run.stdout
         assert 'missing' in run.stderr and 'does not exist' in run.stderr, run.stderr
         assert not fixture.errors, fixture.errors
-        queries = [q for q in fixture.queries if 'information_schema.columns' in q]
+        queries = [q for q in fixture.queries if 'information_schema.columns' in q.lower()]
         assert len(queries) >= 4 and "table_name='mIXED'" in queries[0], queries
         assert "table_name='other'" in queries[1], queries
         assert "table_name=" not in queries[2], queries
         assert "table_name='missing'" in queries[3], queries
-        print(json.dumps({'point_lookup': True, 'canonical_case': True, 'cached_lookup': True,
-                          'enumeration_tables': 2, 'missing_table': True}))
+        stats_queries = [q for q in fixture.queries if 'information_schema.statistics' in q.lower()]
+        assert stats_queries and "TABLE_SCHEMA = 'fixture'" in stats_queries[0], stats_queries
+        if reject_prepare:
+            assert fixture.prepared_queries == ['SELECT 1'], fixture.prepared_queries
     finally:
         fixture.shutdown()
         fixture.server_close()
+
+
+def main():
+    run_case(False)
+    run_case(True)
+    print(json.dumps({'point_lookup': True, 'canonical_case': True, 'cached_lookup': True,
+                      'enumeration_tables': 2, 'indexes_lookup': True,
+                      'wide_decimal_fallback': True, 'no_com_stmt_prepare_fallback': True,
+                      'missing_table': True}))
 
 
 if __name__ == '__main__':

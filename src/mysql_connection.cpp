@@ -280,6 +280,25 @@ MySQLBackendCapabilities MySQLConnection::DetectBackendCapabilities() {
 	} else if (caps.kind == MySQLBackendKind::MYSQL_LIKE_UNKNOWN) {
 		caps.kind = MySQLBackendKind::MYSQL_STANDARD;
 	}
+
+	// Probe whether the server/proxy supports COM_STMT_PREPARE (e.g., StarRocks 3.x,
+	// Doris, or MySQL proxies may reject it with ER_UNKNOWN_COM_ERROR / COM_STMT_PREPARE).
+	if (caps.supports_prepared_statement) {
+		auto probe_stmt = MySQLStatementPtr(mysql_stmt_init(con), MySQLStatementDelete);
+		if (probe_stmt) {
+			static const char kProbeSql[] = "SELECT 1";
+			if (mysql_stmt_prepare(probe_stmt.get(), kProbeSql, sizeof(kProbeSql) - 1) != 0) {
+				unsigned int stmt_err = mysql_stmt_errno(probe_stmt.get());
+				const char *raw_msg = mysql_stmt_error(probe_stmt.get());
+				string lower_msg = StringUtil::Lower(raw_msg ? string(raw_msg) : string());
+				if (stmt_err == 1047 || stmt_err == 1295 ||
+				    StringUtil::Contains(lower_msg, "com_stmt_prepare") ||
+				    StringUtil::Contains(lower_msg, "prepared statement")) {
+					caps.supports_prepared_statement = false;
+				}
+			}
+		}
+	}
 	return caps;
 }
 

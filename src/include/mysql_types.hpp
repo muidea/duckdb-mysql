@@ -16,8 +16,14 @@ namespace duckdb {
 struct MySQLTypeData {
 	string type_name;
 	string column_type;
-	int64_t precision;
-	int64_t scale;
+	int64_t precision = -1;
+	int64_t scale = -1;
+
+	MySQLTypeData() = default;
+	MySQLTypeData(string type_name_p, string column_type_p, int64_t precision_p = -1, int64_t scale_p = -1)
+	    : type_name(std::move(type_name_p)), column_type(std::move(column_type_p)),
+	      precision(precision_p), scale(scale_p) {
+	}
 };
 
 enum class MySQLTypeAnnotation { STANDARD, CAST_TO_VARCHAR, NUMERIC_AS_DOUBLE, CTID, JSONB, FIXED_LENGTH_CHAR };

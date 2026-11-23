@@ -1,4 +1,5 @@
 #include "storage/mysql_index_set.hpp"
+#include "storage/mysql_catalog.hpp"
 #include "storage/mysql_schema_entry.hpp"
 #include "storage/mysql_transaction.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -31,10 +32,15 @@ void MySQLIndexSet::DropEntry(ClientContext &context, DropInfo &info) {
 }
 
 void MySQLIndexSet::LoadEntries(ClientContext &context) {
+	auto &mysql_catalog = catalog.Cast<MySQLCatalog>();
+	if (mysql_catalog.GetBackendCapabilities().IsStarRocksLegacy()) {
+		return;
+	}
+
 	auto query = StringUtil::Replace(R"(
 SELECT DISTINCT TABLE_NAME, INDEX_NAME
 FROM INFORMATION_SCHEMA.STATISTICS
-WHERE TABLE_SCHEMA = 'mysqlscanner';
+WHERE TABLE_SCHEMA = ${SCHEMA_NAME};
 )",
 	                                 "${SCHEMA_NAME}", MySQLUtils::WriteLiteral(schema.name.GetIdentifierName()));
 
