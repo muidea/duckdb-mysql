@@ -248,10 +248,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		deadline.reset();
 		pooled.Invalidate();
 	}
-	out.SetCardinality(1);
 	out.SetValue(0, 0, Value(error));
 	out.SetValue(1, 0, Value(stage));
 	out.SetValue(2, 0, Value(document));
+	out.SetChildCardinality(1);
 }
 } // namespace
 void RegisterMySQLDDLMetadata(ExtensionLoader &loader) {

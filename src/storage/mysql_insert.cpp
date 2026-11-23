@@ -173,7 +173,7 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 			break;
 		}
 	}
-	gstate.varchar_chunk.SetCardinality(chunk.size());
+	gstate.varchar_chunk.SetChildCardinality(chunk.size());
 	// for each column type check if we need to add quotes or not
 	vector<bool> add_quotes;
 	for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
@@ -254,8 +254,8 @@ SinkFinalizeType MySQLInsert::Finalize(Pipeline &pipeline, Event &event, ClientC
 SourceResultType MySQLInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                               OperatorSourceInput &input) const {
 	auto &insert_gstate = sink_state->Cast<MySQLInsertGlobalState>();
-	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(insert_gstate.insert_count));
+	chunk.SetChildCardinality(1);
 
 	return SourceResultType::FINISHED;
 }

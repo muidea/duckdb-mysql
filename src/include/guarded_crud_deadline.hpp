@@ -19,9 +19,19 @@ class GuardedCRUDDeadline {
 public:
     GuardedCRUDDeadline(ClientContext &context, int socket, unsigned int seconds = 30) : worker([this, &context, socket, seconds]() {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        auto interrupt_deadline = deadline;
+        bool interrupted = false;
         std::unique_lock<std::mutex> guard(lock);
         while (!done) {
-            if (context.IsInterrupted() || std::chrono::steady_clock::now() >= deadline) {
+            auto now = std::chrono::steady_clock::now();
+            if (!interrupted && context.IsInterrupted()) {
+                interrupted = true;
+                auto grace = now + std::chrono::seconds(1);
+                if (grace < interrupt_deadline) {
+                    interrupt_deadline = grace;
+                }
+            }
+            if (now >= deadline || (interrupted && now >= interrupt_deadline)) {
 #ifdef _WIN32
                 shutdown(socket, SD_BOTH);
 #else

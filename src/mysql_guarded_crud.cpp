@@ -444,11 +444,11 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         deadline.reset(); // Stop/join the socket watcher before closing or returning the connection.
         pooled.Invalidate(); // No transport reconnect/retry, no session state reuse.
     }
-    out.SetCardinality(1);
     if (d.diagnostics) out.SetValue(6 + (d.returning ? 1 : 0), 0, Value(source.JSON()));
     out.SetValue(0,0,Value(status));out.SetValue(1,0,Value::BIGINT(affected));out.SetValue(2,0,Value(error));
     out.SetValue(3,0,Value(stage));out.SetValue(4,0,Value(version));out.SetValue(5,0,Value(descriptor));
     if(d.returning)out.SetValue(6,0,Value(status=="COMMITTED"?returned_rows:""));
+    out.SetChildCardinality(1);
 }
 }
 void RegisterMySQLGuardedCRUD(ExtensionLoader &loader) {
