@@ -24,7 +24,9 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
 }
 static unique_ptr<FunctionData> BindContract(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
                                              vector<Identifier> &names, int32_t contract) {
-	auto intent = GuardedDDLIntent::Bind(in.inputs, true, contract);
+	auto cond = in.named_parameters.find("conditional");
+	const bool conditional = cond != in.named_parameters.end() && !cond->second.IsNull() && cond->second.GetValue<bool>();
+	auto intent = GuardedDDLIntent::Bind(in.inputs, true, contract, conditional);
 	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(GuardedDDLIntent::Text(in.inputs[0])));
 	if (!db || db->GetCatalog().GetCatalogType() != "mysql")
 		throw BinderException("DDL catalog is unavailable");
@@ -49,7 +51,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 		throw BinderException("DDL contract is unavailable");
 	}
 	const int32_t contract = sf[0].GetValue<int32_t>();
-	if (contract < 2 || contract > 5) {
+	if (contract < 2 || contract > 6) {
 		throw BinderException("DDL contract is unavailable");
 	}
 	return BindContract(ctx, in, types, names, contract);
@@ -234,28 +236,41 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			throw IOException("DDL session reset failed");
 		auto version = Scalar(raw, "SELECT VERSION()");
 		auto comment = Scalar(raw, "SELECT @@version_comment");
+		auto lower_comment = StringUtil::Lower(comment);
+		auto lower_version = StringUtil::Lower(version);
 		bool distribution =
-		    ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
-		    ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
-		if (((mariadb && comment.find("MariaDB") == string::npos) ||
-		     (!mariadb && !distribution && comment.find("MySQL") == string::npos)) ||
+		    ((comment == "Ubuntu" || comment == "(Ubuntu)" || lower_comment.find("ubuntu") != string::npos) &&
+		     (lower_version.find("ubuntu") != string::npos || lower_version.find("ubu") != string::npos)) ||
+		    ((comment == "Debian" || comment == "(Debian)" || lower_comment.find("debian") != string::npos) &&
+		     (lower_version.find("debian") != string::npos || lower_version.find("deb") != string::npos));
+		bool mariadb_identity =
+		    lower_comment.find("mariadb") != string::npos ||
+		    (distribution && lower_version.find("mariadb") != string::npos);
+		bool mysql_identity =
+		    !mariadb_identity && (distribution || comment.find("MySQL") != string::npos);
+		if ((mariadb ? !mariadb_identity : !mysql_identity) ||
 		    Scalar(raw, "SELECT DATABASE()") != d.intent.database) {
 			error = "0A000";
 			throw IOException("DDL source not certified");
 		}
 		const bool change_column = d.intent.action == "rename_column" &&
 		                           (mariadb ? !VersionAtLeast(version, 10, 5, 0) : !VersionAtLeast(version, 8, 0, 0));
+		const bool alter_type = d.intent.action == "alter_column_type";
+		const bool alter_nullability = d.intent.action == "set_not_null" || d.intent.action == "drop_not_null";
+		const bool rewrite_column = change_column || alter_type || alter_nullability;
+		const bool schema_action = d.intent.action == "create_schema" || d.intent.action == "drop_schema";
 		if (change_column && !mariadb && !VersionAtLeast(version, 5, 7, 0)) {
 			error = "0A000";
 			throw IOException("DDL column rename has no equivalent native syntax");
 		}
-		if (d.intent.action == "add_constraint" && d.intent.constraint_kind == "check" &&
+		if (((d.intent.action == "add_constraint" && d.intent.constraint_kind == "check") ||
+		     (d.intent.action == "create_table" && d.intent.has_check_constraint)) &&
 		    (mariadb ? !VersionAtLeast(version, 10, 2, 1)
 		             : (!VersionAtLeast(version,8,0,16) || Scalar(raw,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='TABLE_CONSTRAINTS' AND COLUMN_NAME='ENFORCED'")!="1"))) {
 			error = "0A000";
 			throw IOException("DDL enforced CHECK is unavailable");
 		}
-		if (Scalar(raw, "SELECT CAST(@@read_only AS CHAR)") != "0" ||
+		if (Scalar(raw, "SELECT CAST((@@read_only<>0) AS CHAR)") != "0" ||
 		    SessionReadOnly(raw) != "0") {
 			error = "25006";
 			throw IOException("DDL source read only");
@@ -271,7 +286,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		bool string_default = false, nullable_null_default = false;
 		const auto target = KeywordHelper::WriteQuoted(d.intent.schema, '`') + "." +
 		                    KeywordHelper::WriteQuoted(d.intent.name, '`');
-		if (change_column) {
+		if (rewrite_column) {
 			stage = "source_lock";
 			// 5.7 SHOW CREATE escapes backslashes even with NO_BACKSLASH_ESCAPES
 			// set. Match its output convention when executing the retained text.
@@ -289,35 +304,94 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		}
 		if (ctx.IsInterrupted())
 			throw InterruptException();
-		if (d.intent.contract_version >= 3) {
+		bool idempotent_skip = false;
+		if (!schema_action && d.intent.action != "drop_index") {
 			const string table = d.intent.action == "rename_index" ? d.intent.owner : d.intent.name;
 			const auto predicate = "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" + MetadataLiteral(table);
 			const bool present =
 			    Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE " + predicate) != "0";
-			if (present && (Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE " + predicate +
-			                                " AND TABLE_TYPE='BASE TABLE' AND ENGINE='InnoDB'") != "1" ||
-			                Scalar(raw, "SELECT count(*) FROM information_schema.partitions WHERE " + predicate +
-			                                " AND PARTITION_NAME IS NOT NULL") != "0")) {
+			if (d.intent.contract_version >= 3 && present &&
+			    (Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE " + predicate +
+			                     " AND TABLE_TYPE='BASE TABLE' AND ENGINE='InnoDB'") != "1" ||
+			     Scalar(raw, "SELECT count(*) FROM information_schema.partitions WHERE " + predicate +
+			                     " AND PARTITION_NAME IS NOT NULL") != "0")) {
 				error = "0A000";
 				throw IOException("DDL ordinary InnoDB table scope is unavailable");
 			}
+			if (d.intent.conditional) {
+				if (d.intent.action == "create_table" && present) {
+					idempotent_skip = true;
+				} else if (d.intent.action == "drop_table" && !present) {
+					idempotent_skip = true;
+				} else if (present) {
+					if (d.intent.action == "add_column") {
+						const auto c_pred = predicate + " AND COLUMN_NAME=" + MetadataLiteral(d.intent.column_specs[0].first);
+						if (Scalar(raw, "SELECT count(*) FROM information_schema.COLUMNS WHERE " + c_pred) != "0") {
+							idempotent_skip = true;
+						}
+					} else if (d.intent.action == "drop_column") {
+						const auto c_pred = predicate + " AND COLUMN_NAME=" + MetadataLiteral(d.intent.column_name);
+						if (Scalar(raw, "SELECT count(*) FROM information_schema.COLUMNS WHERE " + c_pred) == "0") {
+							idempotent_skip = true;
+						}
+					} else if (d.intent.action == "create_index" || d.intent.action == "create_unique_index") {
+						const auto i_pred = predicate + " AND INDEX_NAME=" + MetadataLiteral(d.intent.index);
+						if (Scalar(raw, "SELECT count(*) FROM information_schema.STATISTICS WHERE " + i_pred) != "0") {
+							idempotent_skip = true;
+						}
+					}
+				}
+			}
+		} else if (d.intent.conditional && d.intent.action == "drop_index") {
+			if (d.intent.owner.empty()) {
+				const auto i_pred = "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) +
+				                    " AND INDEX_NAME=" + MetadataLiteral(d.intent.name);
+				if (Scalar(raw, "SELECT count(*) FROM information_schema.STATISTICS WHERE " + i_pred) == "0") {
+					idempotent_skip = true;
+				} else {
+					error = "0A000";
+					throw IOException("DDL index owner scope required");
+				}
+			} else {
+				const auto i_pred = "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) +
+				                    " AND TABLE_NAME=" + MetadataLiteral(d.intent.owner) +
+				                    " AND INDEX_NAME=" + MetadataLiteral(d.intent.name);
+				if (Scalar(raw, "SELECT count(*) FROM information_schema.STATISTICS WHERE " + i_pred) == "0") {
+					idempotent_skip = true;
+				}
+			}
+		} else if (d.intent.conditional && schema_action) {
+			const bool schema_present =
+			    Scalar(raw, "SELECT count(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=" +
+			                    MetadataLiteral(d.intent.name)) != "0";
+			if ((d.intent.action == "create_schema" && schema_present) ||
+			    (d.intent.action == "drop_schema" && !schema_present)) {
+				idempotent_skip = true;
+			}
 		}
 		auto native_sql = d.intent.sql;
-		if (change_column) {
+		if (!idempotent_skip && rewrite_column) {
 			canonical_column = ResolveColumn(raw, target, d.intent.column_name);
 			definition = MySQLRenameDefinition::Parse(ShowCreate(raw, target), d.intent.name);
 			auto execution_definition = definition;
-			const auto properties = Scalar(raw, "SELECT CONCAT(COALESCE(CHARACTER_SET_NAME,'binary'),':',DATA_TYPE,':',"
-			                                   "IF(COLUMN_DEFAULT IS NULL,'0','1'),':',IF(GENERATION_EXPRESSION='','0','1'),':',IS_NULLABLE) FROM information_schema.COLUMNS WHERE "
-			                                   "TABLE_SCHEMA=" + MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" +
-			                                   MetadataLiteral(d.intent.name) + " AND BINARY COLUMN_NAME=BINARY " +
-			                                   MetadataLiteral(canonical_column));
+			const auto properties = Scalar(
+			    raw,
+			    string("SELECT CONCAT(COALESCE(CHARACTER_SET_NAME,'binary'),':',DATA_TYPE,':',") +
+			        (mariadb ? "IF(COLUMN_DEFAULT IS NULL OR COLUMN_DEFAULT='NULL','0','1')"
+			                 : "IF(COLUMN_DEFAULT IS NULL,'0','1')") +
+			        ",':',IF(COALESCE(GENERATION_EXPRESSION,'')='','0','1'),':',IS_NULLABLE) FROM information_schema.COLUMNS WHERE "
+			        "TABLE_SCHEMA=" +
+			        MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" + MetadataLiteral(d.intent.name) +
+			        " AND BINARY COLUMN_NAME=BINARY " + MetadataLiteral(canonical_column));
 			auto parts = StringUtil::Split(properties, ':');
 			if (parts.size() != 5) {
 				throw std::invalid_argument("DDL source default metadata incomplete");
 			}
 			nullable_null_default = parts[2] == "0" && parts[3] == "0" && parts[4] == "YES";
 			if (parts[3] == "1") {
+				if (alter_type || alter_nullability) {
+					throw std::invalid_argument("DDL generated column attributes cannot be altered");
+				}
 				// SHOW CREATE can replace each byte of a four-byte literal in
 				// a generated expression with '?'. I_S may truncate it instead,
 				// so neither text is an independent proof of that expression.
@@ -343,12 +417,19 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 				default_hex = DefaultHex(raw, d.intent.schema, d.intent.name, canonical_column, default_charset);
 				execution_definition.StringDefault(canonical_column, parts[0], default_hex);
 			}
-			native_sql = execution_definition.Change(d.intent.schema, d.intent.name, canonical_column, d.intent.new_name);
+			native_sql = alter_type
+			                 ? execution_definition.AlterType(d.intent.schema, d.intent.name, canonical_column,
+			                                                  d.intent.column_specs[0].second)
+			             : alter_nullability
+			                 ? execution_definition.AlterNullability(d.intent.schema, d.intent.name, canonical_column,
+			                                                         d.intent.action == "set_not_null")
+			                 : execution_definition.Change(d.intent.schema, d.intent.name, canonical_column,
+			                                               d.intent.new_name);
 			if (native_sql.size() > 65536) {
 				throw std::invalid_argument("DDL generated definition limit exceeded");
 			}
 		}
-		if (d.intent.action == "drop_constraint") {
+		if (!idempotent_skip && d.intent.action == "drop_constraint") {
 			auto literal = [](const string &v) {
 				return "'" + StringUtil::Replace(v, "'", "''") + "'";
 			};
@@ -359,7 +440,12 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			const auto target =
 			    KeywordHelper::WriteQuoted(d.intent.schema, '`') + "." + KeywordHelper::WriteQuoted(d.intent.name, '`');
 			const auto name = KeywordHelper::WriteQuoted(d.intent.constraint_name, '`');
-			if (kind == "PRIMARY KEY")
+			if (kind == "MISSING" && d.intent.conditional) {
+				if (Scalar(raw, "SELECT count(*) FROM information_schema.tables WHERE TABLE_SCHEMA=" +
+				                    MetadataLiteral(d.intent.schema) + " AND TABLE_NAME=" + MetadataLiteral(d.intent.name)) == "1") {
+					idempotent_skip = true;
+				}
+			} else if (kind == "PRIMARY KEY")
 				native_sql = "ALTER TABLE " + target + " DROP PRIMARY KEY";
 			else if (kind == "UNIQUE")
 				native_sql = "ALTER TABLE " + target + " DROP INDEX " + name;
@@ -371,6 +457,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			// If no supported catalog kind is visible, send the original
 			// native DROP CONSTRAINT form and retain the source's own error.
 		}
+		if (idempotent_skip) {
+			status = "COMMITTED";
+			stage.clear();
+		} else {
 		stage = "source_execute";
 		if (ctx.IsInterrupted()) {
 			throw InterruptException();
@@ -383,14 +473,23 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			error = s && strlen(s) == 5 ? s : "HY000";
 			// Unknown/native partial effects are not reported as an unsent request.
 			switch (code) {
+			case 1007:
+			case 1008:
 			case 1054:
 			case 1064:
 			case 1067:
 			case 1171:
+			case 1265:
+			case 1292:
 			case 1364:
+			case 1366:
 			case 1048:
 			case 1062:
 			case 1138:
+			case 1406:
+			case 1832:
+			case 1833:
+			case 3780:
 			case 3819:
 			case 3823:
 			case 1050:
@@ -428,6 +527,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			}
 			stage.clear();
 		}
+		}
 	} catch (const std::invalid_argument &) {
 		// Parsing/size failures have no source errno; distinguish these from
 		// transport failures. A confirmed commit is never rewritten as unsent.
@@ -461,6 +561,7 @@ void RegisterMySQLGuardedDDL(ExtensionLoader &loader) {
   auto register_function = [&](TableFunction function) {
 	  function.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
 		  options.Add("source_diagnostics", LogicalType::BOOLEAN);
+		  options.Add("conditional", LogicalType::BOOLEAN);
 	  });
 	  loader.RegisterFunction(function);
   };

@@ -3,11 +3,12 @@
 #include <cstdlib>
 
 namespace duckdb {
-inline GuardedDDLIntent GuardedDDLIntent::BindV4(const vector<Value> &input, bool mysql) {
+inline GuardedDDLIntent GuardedDDLIntent::BindV4(const vector<Value> &input, bool mysql, bool conditional) {
 	if (input.size() != 5)
 		throw BinderException("DDL structured input is invalid");
 	GuardedDDLIntent d;
 	d.contract_version = 4;
+	d.conditional = conditional;
 	d.database = Text(input[1]);
 	d.schema = Text(input[2]);
 	d.operation = Text(input[3]);
@@ -130,10 +131,8 @@ inline GuardedDDLIntent GuardedDDLIntent::BindV4(const vector<Value> &input, boo
 	} else if (d.action == "drop_default") {
 		d.sql = alter + " ALTER COLUMN " + quote(d.column_name) + " DROP DEFAULT";
 	} else if (d.action == "set_not_null" || d.action == "drop_not_null") {
-		// MySQL MODIFY needs a full column definition and could overwrite attributes
-		// changed concurrently. There is no equivalent attribute-only native syntax.
-		if (mysql)
-			throw BinderException("DDL nullability has no equivalent native syntax");
+		// For MySQL/MariaDB, the executor builds the safe MODIFY COLUMN under LOCK TABLES
+		// using MySQLRenameDefinition::AlterNullability so defaults/comments/attributes stay intact.
 		d.sql = alter + " ALTER COLUMN " + quote(d.column_name) +
 		        (d.action == "set_not_null" ? " SET NOT NULL" : " DROP NOT NULL");
 	} else if (d.action == "add_constraint") {

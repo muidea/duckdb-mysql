@@ -181,8 +181,15 @@ static CanonicalPGType Canonical(const string &data_type, const string &column_t
         return out;
     }
     if (data_type == "tinyint") {
-        // Phase 1 preserves the existing TinyInt/BOOLEAN compatibility path; the
-        // canonical int2 mapping requires the TinyInt range rules to move here.
+        if (column_type == "tinyint(1)") {
+            out.name = "bool";
+            out.oid = 16;
+        } else {
+            out.name = "int2";
+            out.oid = 21;
+        }
+        out.supported = no_text;
+        if (!out.supported) out.reason = "tinyint_metadata_not_certified";
         return out;
     }
     if (data_type == "smallint") { out.name = "int2"; out.oid = 21; out.supported = true; return out; }
@@ -214,7 +221,7 @@ static CanonicalPGType Canonical(const string &data_type, const string &column_t
         if (precision > 6 || !no_text) return out;
         if (data_type == "datetime") { out.name = "timestamp"; out.oid = 1114; out.typmod = precision; out.supported = true; }
         else if (data_type == "timestamp") { out.name = "timestamptz"; out.oid = 1184; out.typmod = precision; out.supported = false; out.reason = "timezone_semantics_not_established"; }
-        else { out.name = "time"; out.oid = 1083; out.typmod = precision; out.supported = false; out.reason = "mysql_time_not_supported"; }
+        else { out.name = "time"; out.oid = 1083; out.typmod = precision; out.supported = true; }
         return out;
     }
     if (data_type == "year") { out.name = "int2"; out.oid = 21; out.supported = false; out.reason = "year_not_supported"; return out; }
@@ -269,7 +276,7 @@ static CanonicalPGType Canonical(const string &data_type, const string &column_t
     return out;
 }
 
-static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
+static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb, bool mariadb) {
     vector<Value> args={Value(d.schema),Value(d.table)};
     auto table=Query(c,"SELECT TABLE_TYPE,ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?",args);
     if (!table->Next() || table->GetString(0)!="BASE TABLE" || table->GetString(1)!="InnoDB" || table->Next()) Reject();
@@ -284,7 +291,7 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
     auto create=Query(c,"SHOW CREATE TABLE "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table));
     if (!create->Next()) Reject(); auto ddl=StableCreate(create->GetString(1));
     string out="{\"database\":"+Quote(d.schema)+",\"table\":"+Quote(d.table)+",\"table_id\":"+Quote(id)+",\"create_sql\":"+Quote(ddl)+",\"columns\":[";
-    auto cols=Query(c,"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COALESCE(CHARACTER_SET_NAME,''),COALESCE(COLLATION_NAME,''),EXTRA,GENERATION_EXPRESSION,COLUMN_DEFAULT,CAST((SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=c.TABLE_SCHEMA AND k.TABLE_NAME=c.TABLE_NAME AND k.INDEX_NAME='PRIMARY') AS CHAR),COLUMN_KEY FROM information_schema.COLUMNS c WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 4097",args);
+    auto cols=Query(c,"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COALESCE(CHARACTER_SET_NAME,''),COALESCE(COLLATION_NAME,''),COALESCE(EXTRA,''),COALESCE(GENERATION_EXPRESSION,''),COLUMN_DEFAULT,CAST((SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=c.TABLE_SCHEMA AND k.TABLE_NAME=c.TABLE_NAME AND k.INDEX_NAME='PRIMARY') AS CHAR),COALESCE(COLUMN_KEY,'') FROM information_schema.COLUMNS c WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 4097",args);
     bool first=true;
     while(cols->Next()) {
         bool automatic=cols->GetString(6)=="auto_increment";
@@ -301,7 +308,8 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb) {
         if (!cols->IsNull(8) && (cols->GetString(1)=="datetime" || cols->GetString(1)=="timestamp") &&
             StringUtil::Upper(cols->GetString(8)).find("CURRENT_TIMESTAMP")==0) Reject();
         if (!first) out+=","; first=false;
-        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"has_default\":"+(!cols->IsNull(8)?"true":"false")+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false");
+        bool has_default = !cols->IsNull(8) && !(mariadb && cols->GetString(8) == "NULL");
+        out+="{\"name\":"+Quote(cols->GetString(0))+",\"data_type\":"+Quote(cols->GetString(1))+",\"column_type\":"+Quote(cols->GetString(2))+",\"nullable\":"+(cols->GetString(3)=="YES"?"true":"false")+",\"charset\":"+Quote(cols->GetString(4))+",\"collation\":"+Quote(cols->GetString(5))+",\"has_default\":"+(has_default?"true":"false")+",\"auto_increment\":"+(automatic?"true":"false")+",\"single_column_primary_key\":"+(primary?"true":"false");
         if (generated) out+=",\"generated\":true";
         auto pg = Canonical(cols->GetString(1), cols->GetString(2), cols->GetString(4), cols->GetString(5));
         if (generated) { pg.supported=false; pg.reason="generated_column_not_writable"; }
@@ -344,7 +352,8 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
     unique_ptr<GuardedCRUDDeadline> deadline;
     try {
         if (ctx.IsInterrupted()) throw InterruptException();
-        if (d.catalog.GetBackendCapabilities().kind!=MySQLBackendKind::MYSQL_STANDARD) Reject("0A000", "capability_adapter");
+        const bool mariadb = d.catalog.GetBackendCapabilities().kind == MySQLBackendKind::MARIADB_STANDARD;
+        if (!mariadb && d.catalog.GetBackendCapabilities().kind!=MySQLBackendKind::MYSQL_STANDARD) Reject("0A000", "capability_adapter");
         pooled=d.catalog.GetConnectionPool().Acquire(dbconnector::pool::AcquireMode::TRY);
         auto &c=pooled.GetConnection();
         deadline = make_uniq<GuardedCRUDDeadline>(ctx, mysql_get_socket(c.GetConn()));
@@ -357,12 +366,22 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         version=Scalar(c,"SELECT VERSION()");
         if (d.execute && version!=d.version) Reject("0A000", "source_descriptor");
         auto comment = Scalar(c,"SELECT @@version_comment");
+        auto lower_comment = StringUtil::Lower(comment);
+        auto lower_version = StringUtil::Lower(version);
         // Distribution builds may identify their packager instead of using
-        // the word MySQL. Do not admit arbitrary wire-compatible products.
-        bool distribution = ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
-                            ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
+        // the word MySQL/MariaDB. Do not admit arbitrary wire-compatible products.
+        bool distribution =
+            ((comment == "Ubuntu" || comment == "(Ubuntu)" || lower_comment.find("ubuntu") != string::npos) &&
+             (lower_version.find("ubuntu") != string::npos || lower_version.find("ubu") != string::npos)) ||
+            ((comment == "Debian" || comment == "(Debian)" || lower_comment.find("debian") != string::npos) &&
+             (lower_version.find("debian") != string::npos || lower_version.find("deb") != string::npos));
+        bool mariadb_identity =
+            lower_comment.find("mariadb") != string::npos ||
+            (distribution && lower_version.find("mariadb") != string::npos);
+        bool mysql_identity =
+            !mariadb_identity && (distribution || comment.find("MySQL") != string::npos);
         if (Scalar(c,"SELECT DATABASE()")!=d.schema ||
-            (!distribution && comment.find("MySQL")==string::npos)) Reject("0A000", "capability_adapter");
+            (mariadb ? !mariadb_identity : !mysql_identity)) Reject("0A000", "capability_adapter");
         auto modern_innodb = Scalar(c,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA='information_schema' AND TABLE_NAME='INNODB_TABLES'") == "1";
         stage="source_session";
         c.Execute("SET SESSION autocommit=1");
@@ -377,31 +396,66 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
         c.Execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); c.Execute("START TRANSACTION");
         auto lock=Query(c,"SELECT * FROM "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table)+" LIMIT 0 LOCK IN SHARE MODE");
         stage="source_metadata";
-        descriptor=Metadata(c,d,modern_innodb);
+        descriptor=Metadata(c,d,modern_innodb,mariadb);
         if (d.execute) {
             stage="source_descriptor";
             if (descriptor!=d.expected) {error="0A000";Reject();}
-            if(d.returning) {
-                auto key=Query(c,"SELECT DATA_TYPE,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? AND COLUMN_KEY='PRI' AND IS_NULLABLE='NO' AND (SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=? AND k.TABLE_NAME=? AND k.INDEX_NAME='PRIMARY')=1",{Value(d.schema),Value(d.table),Value(d.returning_name),Value(d.schema),Value(d.table)});
-                if(!key->Next()) Reject();auto type=key->GetString(0);automatic_key=key->GetString(1)=="auto_increment";
-                auto oid=type=="smallint"?21:type=="int"||type=="mediumint"?23:type=="bigint"?20:0;
-                if(oid!=d.returning_oid || key->Next() || (d.returning_keys.empty() && !automatic_key)) Reject();
-            }
             if (ctx.IsInterrupted()) {error="57014";throw InterruptException();}
             stage="source_execute";
             MySQLStatementPtr prepared(mysql_stmt_init(c.GetConn()),MySQLStatementDelete);
             if (!prepared) Reject();
             if (mysql_stmt_prepare(prepared.get(),d.sql.c_str(),d.sql.size())!=0) {source=SourceError(c.GetConn(),prepared.get());error=ErrorState(mysql_stmt_errno(prepared.get()));Reject();}
             auto statement=make_uniq<MySQLStatement>(d.sql,prepared.release(),vector<MySQLField>());
-            if (mysql_stmt_field_count(statement->get())!=0 || mysql_stmt_param_count(statement->get())!=d.params.size()) Reject();
+            auto field_count = mysql_stmt_field_count(statement->get());
+            const bool is_delete_returning =
+                d.returning && mariadb && StringUtil::Upper(d.sql).rfind("DELETE ", 0) == 0;
+            const bool native_returning =
+                d.returning && mariadb && (field_count == 1 || (field_count == 0 && is_delete_returning));
+            if ((field_count != 0 && !native_returning) || mysql_stmt_param_count(statement->get())!=d.params.size()) Reject();
+            if(d.returning && !native_returning) {
+                auto key=Query(c,"SELECT DATA_TYPE,COALESCE(EXTRA,'') FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? AND COLUMN_KEY='PRI' AND IS_NULLABLE='NO' AND (SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=? AND k.TABLE_NAME=? AND k.INDEX_NAME='PRIMARY')=1",{Value(d.schema),Value(d.table),Value(d.returning_name),Value(d.schema),Value(d.table)});
+                if(!key->Next()) Reject();auto type=key->GetString(0);automatic_key=key->GetString(1)=="auto_increment";
+                auto oid=type=="smallint"?21:type=="int"||type=="mediumint"?23:type=="bigint"?20:0;
+                if(oid!=d.returning_oid || key->Next() || (d.returning_keys.empty() && !automatic_key)) Reject();
+            } else if (native_returning) {
+                if (!d.returning_keys.empty()) Reject();
+                auto col=Query(c,"SELECT DATA_TYPE,COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=?",{Value(d.schema),Value(d.table),Value(d.returning_name)});
+                if(!col->Next()) Reject();
+                auto type=col->GetString(0), ctype=col->GetString(1);
+                if (col->Next() || ctype.find("unsigned")!=string::npos || ctype.find("zerofill")!=string::npos) Reject();
+                auto oid=type=="smallint"?21:type=="int"||type=="mediumint"?23:type=="bigint"?20:0;
+                if(oid!=d.returning_oid) Reject();
+            }
             auto raw_statement=statement->get();
             sent=true;
+            unique_ptr<MySQLResult> result;
             try {
-                auto result=c.Query(*statement,d.params,MySQLResultStreaming::FORCE_MATERIALIZATION);
-                affected=result->AffectedRows();
+                result=c.Query(*statement,d.params,MySQLResultStreaming::FORCE_MATERIALIZATION);
+                if (!native_returning) {
+                    affected=result->AffectedRows();
+                }
             } catch (...) {source=SourceError(c.GetConn(),raw_statement);error=ErrorState(mysql_stmt_errno(raw_statement));throw;}
             if (mysql_warning_count(c.GetConn())!=0) {error="01000";Reject();}
-            if(d.returning) {
+            if(native_returning) {
+                if (result->Fields().size() != 1) Reject();
+                int64_t count=0;
+                while(true) {
+                    auto &chunk = result->NextChunk();
+                    if (chunk.size() == 0) break;
+                    if (chunk.ColumnCount() != 1) Reject();
+                    for (idx_t r = 0; r < chunk.size(); r++) {
+                        if (++count > 4096) Reject();
+                        auto val = chunk.GetValue(0, r);
+                        if (val.IsNull()) Reject();
+                        auto id = val.DefaultCastAs(LogicalType::VARCHAR).ToString();
+                        if(id.empty() || id.size()>20 || id.find_first_not_of("0123456789-")!=string::npos) Reject();
+                        if(count>1)returned_rows+=",";returned_rows+="["+Quote(id)+"]";
+                    }
+                }
+                affected=count;
+                if(mysql_warning_count(c.GetConn())!=0) Reject();
+                returned_rows+="]";
+            } else if(d.returning) {
                 vector<Value> keys=d.returning_keys;
                 if(keys.empty()) {
                     auto id=mysql_stmt_insert_id(raw_statement);

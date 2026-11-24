@@ -139,7 +139,8 @@ MySQLParameter::MySQLParameter(const string &query, Value value_p) : value(std::
 		FillTimestampBuffer(value, bind_buffer);
 		break;
 	case LogicalTypeId::VARCHAR:
-		// use string ref from the value
+	case LogicalTypeId::BLOB:
+		// use string/byte ref from the value
 		break;
 	default:
 		throw IOException("Unsupported parameters type: \"%s\", MySQL query \"%s\"", value.type(), query.c_str());
@@ -157,6 +158,14 @@ MYSQL_BIND MySQLParameter::CreateBind() {
 		const string &str = StringValue::Get(value);
 		bind.buffer_type = MYSQL_TYPE_VAR_STRING;
 		bind.buffer = const_cast<char *>(str.c_str());
+		bind.buffer_length = str.length();
+		bind_length = str.length();
+		bind.length = &bind_length;
+	} else if (value.type().id() == LogicalTypeId::BLOB) {
+		static char empty_blob_byte = 0;
+		const string &str = StringValue::Get(value);
+		bind.buffer_type = MYSQL_TYPE_BLOB;
+		bind.buffer = str.empty() ? &empty_blob_byte : const_cast<char *>(str.data());
 		bind.buffer_length = str.length();
 		bind_length = str.length();
 		bind.length = &bind_length;

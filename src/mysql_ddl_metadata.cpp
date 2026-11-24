@@ -164,11 +164,19 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			throw IOException("DDL metadata session is not idle");
 		auto version = Scalar(c, "SELECT VERSION()");
 		auto comment = Scalar(c, "SELECT @@version_comment");
+		auto lower_comment = StringUtil::Lower(comment);
+		auto lower_version = StringUtil::Lower(version);
 		bool distribution =
-		    ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
-		    ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
-		if (((mariadb && comment.find("MariaDB") == string::npos) ||
-		     (!mariadb && !distribution && comment.find("MySQL") == string::npos)) ||
+		    ((comment == "Ubuntu" || comment == "(Ubuntu)" || lower_comment.find("ubuntu") != string::npos) &&
+		     (lower_version.find("ubuntu") != string::npos || lower_version.find("ubu") != string::npos)) ||
+		    ((comment == "Debian" || comment == "(Debian)" || lower_comment.find("debian") != string::npos) &&
+		     (lower_version.find("debian") != string::npos || lower_version.find("deb") != string::npos));
+		bool mariadb_identity =
+		    lower_comment.find("mariadb") != string::npos ||
+		    (distribution && lower_version.find("mariadb") != string::npos);
+		bool mysql_identity =
+		    !mariadb_identity && (distribution || comment.find("MySQL") != string::npos);
+		if ((mariadb ? !mariadb_identity : !mysql_identity) ||
 		    Scalar(c, "SELECT DATABASE()") != d.schema) {
 			error = "0A000";
 			throw IOException("DDL metadata identity mismatch");

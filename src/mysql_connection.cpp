@@ -101,7 +101,7 @@ idx_t MySQLConnection::MySQLExecute(MYSQL_STMT *stmt, const string &query, const
 
 	idx_t affected_rows = mysql_stmt_affected_rows(stmt);
 
-	if (!streaming && affected_rows == static_cast<idx_t>(-1)) {
+	if (!streaming && (affected_rows == static_cast<idx_t>(-1) || mysql_stmt_field_count(stmt) > 0)) {
 		bool btrue = true;
 		auto res_attr = mysql_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &btrue);
 		if (res_attr != 0) {

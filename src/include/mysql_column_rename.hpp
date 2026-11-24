@@ -168,6 +168,287 @@ struct MySQLRenameDefinition {
 		Invalid();
 		return {};
 	}
+	static std::string UpperWord(const std::string &s, size_t p, size_t len) {
+		std::string out;
+		out.reserve(len);
+		for (size_t i = 0; i < len && p + i < s.size(); i++) {
+			char c = s[p + i];
+			if (c >= 'a' && c <= 'z') {
+				c = static_cast<char>(c - 'a' + 'A');
+			}
+			out += c;
+		}
+		return out;
+	}
+	static bool IdentChar(char c) {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+	}
+	// Scan past `<type>[(args)] [UNSIGNED|SIGNED|ZEROFILL] [CHARACTER SET x] [CHARSET x] [COLLATE y]`.
+	static size_t TypePrefixEnd(const std::string &s) {
+		size_t p = 0;
+		SkipSpace(s, p);
+		size_t word_start = p;
+		while (p < s.size() && IdentChar(s[p])) {
+			p++;
+		}
+		if (p == word_start) {
+			Invalid();
+		}
+		SkipSpace(s, p);
+		// Handle multi-word base types like DOUBLE PRECISION
+		if (p < s.size() && IdentChar(s[p])) {
+			size_t save = p;
+			size_t second_start = p;
+			while (p < s.size() && IdentChar(s[p])) {
+				p++;
+			}
+			auto second = UpperWord(s, second_start, p - second_start);
+			if (second == "PRECISION" || second == "VARYING") {
+				SkipSpace(s, p);
+			} else {
+				p = save;
+			}
+		}
+		// Optional parenthesized modifiers e.g. (11), (18,4), ('a','b')
+		if (p < s.size() && s[p] == '(') {
+			int depth = 1;
+			char q = 0;
+			p++;
+			while (p < s.size() && depth > 0) {
+				char c = s[p++];
+				if (q) {
+					if (c == '\\' && q != '`') {
+						if (p < s.size()) {
+							p++;
+						}
+					} else if (c == q) {
+						if (p < s.size() && s[p] == q) {
+							p++;
+						} else {
+							q = 0;
+						}
+					}
+				} else if (c == '\'' || c == '"' || c == '`') {
+					q = c;
+				} else if (c == '(') {
+					depth++;
+				} else if (c == ')') {
+					depth--;
+				}
+			}
+			if (depth != 0) {
+				Invalid();
+			}
+			SkipSpace(s, p);
+		}
+		while (p < s.size()) {
+			size_t save = p;
+			if (!IdentChar(s[p])) {
+				break;
+			}
+			size_t wstart = p;
+			while (p < s.size() && IdentChar(s[p])) {
+				p++;
+			}
+			auto kw = UpperWord(s, wstart, p - wstart);
+			SkipSpace(s, p);
+			if (kw == "UNSIGNED" || kw == "SIGNED" || kw == "ZEROFILL") {
+				continue;
+			}
+			if (kw == "CHARACTER") {
+				size_t set_start = p;
+				while (p < s.size() && IdentChar(s[p])) {
+					p++;
+				}
+				if (UpperWord(s, set_start, p - set_start) == "SET") {
+					SkipSpace(s, p);
+					size_t cs_start = p;
+					while (p < s.size() && IdentChar(s[p])) {
+						p++;
+					}
+					if (p > cs_start) {
+						SkipSpace(s, p);
+						continue;
+					}
+				}
+				p = save;
+				break;
+			}
+			if (kw == "CHARSET" || kw == "COLLATE") {
+				size_t id_start = p;
+				while (p < s.size() && IdentChar(s[p])) {
+					p++;
+				}
+				if (p > id_start) {
+					SkipSpace(s, p);
+					continue;
+				}
+				p = save;
+				break;
+			}
+			p = save;
+			break;
+		}
+		return p;
+	}
+	// Replace only the leading type/charset/collation prefix so column nullability, defaults,
+	// AUTO_INCREMENT, and comments are preserved.
+	std::string AlterType(const std::string &schema, const std::string &table, const std::string &col_name,
+	                      const std::string &new_type) const {
+		for (auto &column : columns) {
+			if (column.name != col_name) {
+				continue;
+			}
+			const auto &s = column.definition;
+			size_t p = TypePrefixEnd(s);
+			std::string suffix = p < s.size() ? " " + s.substr(p) : std::string();
+			return "ALTER TABLE " + Quote(schema) + "." + Quote(table) + " MODIFY COLUMN " + Quote(col_name) + " " +
+			       new_type + suffix;
+		}
+		Invalid();
+		return {};
+	}
+	// Rewrite only the top-level NOT NULL / NULL clause (and DEFAULT NULL when setting NOT NULL),
+	// preserving type, charset/collation, defaults, AUTO_INCREMENT, and comments.
+	std::string AlterNullability(const std::string &schema, const std::string &table, const std::string &col_name,
+	                             bool set_not_null) const {
+		for (auto &column : columns) {
+			if (column.name != col_name) {
+				continue;
+			}
+			const auto &s = column.definition;
+			size_t p = TypePrefixEnd(s);
+			size_t prefix_end = p;
+			while (prefix_end > 0 && Space(s[prefix_end - 1])) {
+				prefix_end--;
+			}
+			std::string prefix = s.substr(0, prefix_end);
+			std::string tail = s.substr(p);
+			std::string cleaned;
+			char quote = 0;
+			int depth = 0;
+			bool comment = false;
+			for (size_t i = 0; i < tail.size();) {
+				char c = tail[i];
+				if (comment) {
+					cleaned += c;
+					if (c == '*' && i + 1 < tail.size() && tail[i + 1] == '/') {
+						cleaned += tail[i + 1];
+						i += 2;
+						comment = false;
+						continue;
+					}
+					i++;
+					continue;
+				}
+				if (quote) {
+					cleaned += c;
+					if (c == '\\' && quote != '`') {
+						if (i + 1 < tail.size()) {
+							cleaned += tail[++i];
+						}
+					} else if (c == quote) {
+						if (i + 1 < tail.size() && tail[i + 1] == quote) {
+							cleaned += tail[++i];
+						} else {
+							quote = 0;
+						}
+					}
+					i++;
+					continue;
+				}
+				if (c == '/' && i + 1 < tail.size() && tail[i + 1] == '*') {
+					comment = true;
+					cleaned += "/*";
+					i += 2;
+					continue;
+				}
+				if (c == '\'' || c == '"' || c == '`') {
+					quote = c;
+					cleaned += c;
+					i++;
+					continue;
+				}
+				if (c == '(') {
+					depth++;
+					cleaned += c;
+					i++;
+					continue;
+				}
+				if (c == ')') {
+					if (depth > 0) {
+						depth--;
+					}
+					cleaned += c;
+					i++;
+					continue;
+				}
+				if (depth == 0 && IdentChar(c) && (i == 0 || !IdentChar(tail[i - 1]))) {
+					size_t wstart = i;
+					while (i < tail.size() && IdentChar(tail[i])) {
+						i++;
+					}
+					std::string kw = UpperWord(tail, wstart, i - wstart);
+					if (kw == "NOT") {
+						size_t after_sp = i;
+						SkipSpace(tail, after_sp);
+						size_t nw = after_sp;
+						while (nw < tail.size() && IdentChar(tail[nw])) {
+							nw++;
+						}
+						if (UpperWord(tail, after_sp, nw - after_sp) == "NULL") {
+							i = nw;
+							SkipSpace(tail, i);
+							continue;
+						}
+					} else if (kw == "NULL") {
+						SkipSpace(tail, i);
+						continue;
+					} else if (kw == "DEFAULT") {
+						size_t after_sp = i;
+						SkipSpace(tail, after_sp);
+						size_t nw = after_sp;
+						while (nw < tail.size() && IdentChar(tail[nw])) {
+							nw++;
+						}
+						if (UpperWord(tail, after_sp, nw - after_sp) == "NULL") {
+							if (set_not_null) {
+								i = nw;
+								SkipSpace(tail, i);
+								continue;
+							}
+							cleaned += tail.substr(wstart, nw - wstart);
+							i = nw;
+							continue;
+						}
+					}
+					cleaned += tail.substr(wstart, i - wstart);
+					continue;
+				}
+				if (depth == 0 && Space(c)) {
+					if (!cleaned.empty() && !Space(cleaned.back())) {
+						cleaned += ' ';
+					}
+					i++;
+					continue;
+				}
+				cleaned += c;
+				i++;
+			}
+			size_t first = 0, last = cleaned.size();
+			while (first < last && Space(cleaned[first])) {
+				first++;
+			}
+			while (last > first && Space(cleaned[last - 1])) {
+				last--;
+			}
+			cleaned = cleaned.substr(first, last - first);
+			return "ALTER TABLE " + Quote(schema) + "." + Quote(table) + " MODIFY COLUMN " + Quote(col_name) + " " +
+			       prefix + (set_not_null ? " NOT NULL" : " NULL") + (cleaned.empty() ? "" : " " + cleaned);
+		}
+		Invalid();
+		return {};
+	}
 	void StringDefault(const std::string &column_name, const std::string &charset, const std::string &hex) {
 		if (charset.empty() || charset.size() > 64 || hex.size() > MAX_BYTES || hex.size() % 2) {
 			Invalid();

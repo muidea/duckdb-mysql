@@ -62,7 +62,7 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
     : source_connection(std::move(source_connection_p)), query(query_p), stmt(std::move(stmt_p)),
       type_config(std::move(type_config_p)), connection_string(connection_string_p), connection_id(connection_id_p),
       streaming(streaming_p), affected_rows(affected_rows_p), fields(std::move(fields_p)) {
-	if (affected_rows != static_cast<idx_t>(-1)) {
+	if (affected_rows != static_cast<idx_t>(-1) && mysql_stmt_field_count(stmt.get()) == 0) {
 		return;
 	}
 	if (this->fields.empty()) {
