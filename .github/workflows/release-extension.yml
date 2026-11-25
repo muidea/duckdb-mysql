@@ -58,7 +58,7 @@ jobs:
                   'vcpkg_commit': 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6',
                   'vcpkg_triplet': 'x64-linux',
                   'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DPOSTGRES_GUARDED_CRUD=ON',
-                  'required_symbol': 'postgres_guarded_crud.cpp',
+                  'required_symbol': 'RegisterPostgresGuardedCRUD',
                   'require_libodbc': 'false',
               },
               'mysql_scanner': {
@@ -66,7 +66,7 @@ jobs:
                   'vcpkg_commit': '84bab45d415d22042bd0b9081aea57f362da3f35',
                   'vcpkg_triplet': 'x64-linux-release',
                   'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DMYSQL_GUARDED_CRUD=ON',
-                  'required_symbol': 'mysql_guarded_mutation',
+                  'required_symbol': 'RegisterMySQLGuardedCRUD',
                   'require_libodbc': 'false',
               },
               'oracle_scanner': {
@@ -74,7 +74,7 @@ jobs:
                   'vcpkg_commit': '',
                   'vcpkg_triplet': '',
                   'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DORACLE_GUARDED_CRUD=ON',
-                  'required_symbol': 'oracle_guarded_mutation',
+                  'required_symbol': 'RegisterOracleGuardedCRUD',
                   'require_libodbc': 'true',
               },
               'sqlserver_scanner': {
@@ -82,7 +82,7 @@ jobs:
                   'vcpkg_commit': '',
                   'vcpkg_triplet': '',
                   'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DSQLSERVER_GUARDED_CRUD=ON',
-                  'required_symbol': 'sqlserver_guarded_mutation',
+                  'required_symbol': 'RegisterSQLServerGuardedCRUD',
                   'require_libodbc': 'true',
               },
               'odbc_catalog_scanner': {
@@ -90,7 +90,7 @@ jobs:
                   'vcpkg_commit': '',
                   'vcpkg_triplet': '',
                   'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0',
-                  'required_symbol': 'db2_guarded_mutation',
+                  'required_symbol': 'RegisterDb2GuardedCRUD',
                   'require_libodbc': 'true',
               },
           }
@@ -159,58 +159,84 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           REPO_NAME: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          ext_bin="build/release/extension/${EXT_NAME}/${EXT_NAME}.duckdb_extension"
-          if [ ! -f "$ext_bin" ]; then
-            ext_bin="$(find build/release -type f -name "${EXT_NAME}.duckdb_extension" -print -quit)"
-          fi
-          test -s "$ext_bin"
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
 
-          missing="$(ldd "$ext_bin" | awk '/not found/{print}' || true)"
-          if [ -n "$missing" ]; then
-            echo "Missing shared libraries in $ext_bin: $missing"
-            exit 1
-          fi
-          if [ "$REQUIRE_LIBODBC" = "true" ]; then
-            ldd "$ext_bin" | grep -q 'libodbc\.so\.2'
-          fi
+          ext_name = os.environ['EXT_NAME']
+          rel_tag = os.environ['REL_TAG']
+          required_symbol = os.environ['REQUIRED_SYMBOL']
+          require_libodbc = os.environ['REQUIRE_LIBODBC'] == 'true'
 
-          strings "$ext_bin" | grep -q "$REQUIRED_SYMBOL"
+          try:
+              ext_bin = pathlib.Path(f'build/release/extension/{ext_name}/{ext_name}.duckdb_extension')
+              if not ext_bin.is_file():
+                  ext_bin = next(pathlib.Path('build/release').rglob(f'{ext_name}.duckdb_extension'), None)
+              assert ext_bin is not None and ext_bin.is_file() and ext_bin.stat().st_size > 0, (
+                  f'Missing extension binary for {ext_name} under build/release'
+              )
+              print(f'Extension binary: {ext_bin} ({ext_bin.stat().st_size} bytes)')
 
-          footer="$(tail -c 512 "$ext_bin" | tr '\0' '\n')"
-          grep -q 'v2.0.0' <<< "$footer"
-          grep -q 'linux_amd64' <<< "$footer"
+              ldd_out = subprocess.check_output(['ldd', str(ext_bin)], text=True)
+              print(ldd_out)
+              assert 'not found' not in ldd_out, f'Missing shared libraries in {ext_bin}'
+              if require_libodbc:
+                  assert 'libodbc.so.2' in ldd_out, f'Expected libodbc.so.2 linkage in {ext_bin}'
 
-          mkdir -p dist
-          raw_asset="dist/${EXT_NAME}-v2.0.0-linux_amd64.duckdb_extension"
-          gz_asset="${raw_asset}.gz"
-          cp "$ext_bin" "$raw_asset"
-          gzip -n -9 -c "$raw_asset" > "$gz_asset"
+              raw = ext_bin.read_bytes()
+              nm_dyn = subprocess.run(['nm', '-D', '--defined-only', str(ext_bin)], capture_output=True, text=True, check=False).stdout
+              nm_all = subprocess.run(['nm', '--defined-only', str(ext_bin)], capture_output=True, text=True, check=False).stdout
+              symbols_text = nm_dyn + '\n' + nm_all
+              guarded_lines = [line.strip() for line in nm_dyn.splitlines() if 'Guarded' in line or 'duckdb_cpp_init' in line]
+              print('Guarded/entry symbols:', guarded_lines[:20])
+              assert required_symbol in symbols_text or required_symbol.encode('utf-8') in raw, (
+                  f'Missing guarded CRUD symbol {required_symbol!r} in {ext_bin}'
+              )
 
-          raw_sha="$(sha256sum "$raw_asset" | awk '{print $1}')"
-          gz_sha="$(sha256sum "$gz_asset" | awk '{print $1}')"
-          (
-            cd dist
-            sha256sum "$(basename "$raw_asset")" "$(basename "$gz_asset")" > SHA256SUMS.txt
+              footer_tokens = [tok.decode('utf-8', errors='replace') for tok in raw[-512:].split(b'\x00') if tok]
+              print('Footer tokens:', footer_tokens)
+              assert 'v2.0.0' in footer_tokens or b'v2.0.0' in raw[-512:], f'Missing v2.0.0 footer in {ext_bin}'
+              assert 'linux_amd64' in footer_tokens or b'linux_amd64' in raw[-512:], f'Missing linux_amd64 footer in {ext_bin}'
+          except AssertionError as exc:
+              print(f'::error::{exc}')
+              raise
+
+          dist_dir = pathlib.Path('dist')
+          dist_dir.mkdir(parents=True, exist_ok=True)
+          raw_asset = dist_dir / f'{ext_name}-v2.0.0-linux_amd64.duckdb_extension'
+          gz_asset = dist_dir / f'{ext_name}-v2.0.0-linux_amd64.duckdb_extension.gz'
+          shutil.copy2(ext_bin, raw_asset)
+          with gz_asset.open('wb') as raw_out:
+              with gzip.GzipFile(filename=raw_asset.name, mode='wb', fileobj=raw_out, compresslevel=9, mtime=0) as gz:
+                  gz.write(raw)
+
+          raw_sha = hashlib.sha256(raw).hexdigest()
+          gz_sha = hashlib.sha256(gz_asset.read_bytes()).hexdigest()
+          (dist_dir / 'SHA256SUMS.txt').write_text(
+              f'{raw_sha}  {raw_asset.name}\n{gz_sha}  {gz_asset.name}\n',
+              encoding='utf-8',
           )
-
-          RAW_SHA="$raw_sha" GZ_SHA="$gz_sha" python3 - <<'PY'
-          import json, os, pathlib
           meta = {
               'repository': os.environ['REPO_NAME'],
-              'extension_name': os.environ['EXT_NAME'],
-              'release_tag': os.environ['REL_TAG'],
+              'extension_name': ext_name,
+              'release_tag': rel_tag,
               'commit_sha': os.environ['COMMIT_SHA'],
               'duckdb_version': 'v2.0.0',
               'platform': 'linux_amd64',
-              'asset': f"{os.environ['EXT_NAME']}-v2.0.0-linux_amd64.duckdb_extension.gz",
-              'uncompressed_sha256': os.environ['RAW_SHA'],
-              'compressed_sha256': os.environ['GZ_SHA'],
+              'asset': gz_asset.name,
+              'uncompressed_sha256': raw_sha,
+              'compressed_sha256': gz_sha,
           }
-          pathlib.Path('dist/release-metadata.json').write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')
+          (dist_dir / 'release-metadata.json').write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f'raw_sha={raw_sha}\n')
+              fh.write(f'gz_asset={gz_asset.as_posix()}\n')
           PY
-          echo "raw_sha=$raw_sha" >> "$GITHUB_OUTPUT"
-          echo "gz_asset=$gz_asset" >> "$GITHUB_OUTPUT"
 
       - name: Publish immutable GitHub Release asset
         env:
