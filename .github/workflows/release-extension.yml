@@ -1,0 +1,235 @@
+# Template GitHub Actions workflow for each custom DuckDB v2.0.0 extension repository
+# (duckdb-postgres, duckdb-mysql, oracle_scanner, sqlserver_scanner, odbc_catalog_scanner)
+# on branch `2.0.0`.
+#
+# Copy into `<extension-repo>/.github/workflows/release-extension.yml`, commit to `2.0.0`,
+# and push a tag `v2.0.0-<rev>` (or run manually via `workflow_dispatch`).
+name: Release DuckDB v2.0.0 Extension
+on:
+  push:
+    tags:
+      - 'v2.0.0-*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag name (e.g. v2.0.0-abc1234567); defaults to v2.0.0-<short_sha>
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ext-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: Build Linux amd64 v2.0.0 Extension
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GEN: ninja
+      STATIC_LIBCPP: '1'
+      OVERRIDE_GIT_DESCRIBE: v2.0.0
+      DUCKDB_PLATFORM: linux_amd64
+      EXTENSION_STATIC_BUILD: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Resolve extension metadata and build flags from Makefile
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          PROFILES = {
+              'postgres_scanner': {
+                  'use_vcpkg': 'true',
+                  'vcpkg_commit': 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6',
+                  'vcpkg_triplet': 'x64-linux',
+                  'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DPOSTGRES_GUARDED_CRUD=ON',
+                  'required_symbol': 'postgres_guarded_crud.cpp',
+                  'require_libodbc': 'false',
+              },
+              'mysql_scanner': {
+                  'use_vcpkg': 'true',
+                  'vcpkg_commit': '84bab45d415d22042bd0b9081aea57f362da3f35',
+                  'vcpkg_triplet': 'x64-linux-release',
+                  'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DMYSQL_GUARDED_CRUD=ON',
+                  'required_symbol': 'mysql_guarded_mutation',
+                  'require_libodbc': 'false',
+              },
+              'oracle_scanner': {
+                  'use_vcpkg': 'false',
+                  'vcpkg_commit': '',
+                  'vcpkg_triplet': '',
+                  'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DORACLE_GUARDED_CRUD=ON',
+                  'required_symbol': 'oracle_guarded_mutation',
+                  'require_libodbc': 'true',
+              },
+              'sqlserver_scanner': {
+                  'use_vcpkg': 'false',
+                  'vcpkg_commit': '',
+                  'vcpkg_triplet': '',
+                  'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DSQLSERVER_GUARDED_CRUD=ON',
+                  'required_symbol': 'sqlserver_guarded_mutation',
+                  'require_libodbc': 'true',
+              },
+              'odbc_catalog_scanner': {
+                  'use_vcpkg': 'false',
+                  'vcpkg_commit': '',
+                  'vcpkg_triplet': '',
+                  'extra_cmake_flags': '-DBUILD_SHELL=0 -DBUILD_UNITTESTS=0',
+                  'required_symbol': 'db2_guarded_mutation',
+                  'require_libodbc': 'true',
+              },
+          }
+
+          makefile = pathlib.Path('Makefile').read_text(encoding='utf-8')
+          match = re.search(r'^EXT_NAME\s*:?=\s*([A-Za-z0-9_]+)\s*$', makefile, re.MULTILINE)
+          assert match, 'Unable to find EXT_NAME in Makefile'
+          ext_name = match.group(1)
+          assert ext_name in PROFILES, f'Unsupported EXT_NAME {ext_name!r}'
+          profile = PROFILES[ext_name]
+
+          if os.environ['EVENT_NAME'] == 'push':
+              release_tag = os.environ['REF_NAME']
+          else:
+              release_tag = os.environ.get('INPUT_TAG', '').strip() or f"v2.0.0-{os.environ['COMMIT_SHA'][:10]}"
+          assert re.fullmatch(r'v2\.0\.0-[A-Za-z0-9._-]+', release_tag), f'invalid release tag: {release_tag}'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f'ext_name={ext_name}\n')
+              fh.write(f'release_tag={release_tag}\n')
+              for key, value in profile.items():
+                  fh.write(f'{key}={value}\n')
+          PY
+
+      - name: Install build and ODBC development dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq \
+            build-essential cmake ninja-build ccache python3 \
+            unixodbc-dev pkg-config libssl-dev zip unzip curl
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ext-${{ steps.meta.outputs.ext_name }}-v2.0.0-linux_amd64
+
+      - name: Setup vcpkg (postgres/mysql)
+        if: steps.meta.outputs.use_vcpkg == 'true'
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: ${{ steps.meta.outputs.vcpkg_commit }}
+
+      - name: Build release DuckDB v2.0.0 extension
+        env:
+          USE_VCPKG: ${{ steps.meta.outputs.use_vcpkg }}
+          VCPKG_TRIPLET: ${{ steps.meta.outputs.vcpkg_triplet }}
+          EXTRA_CMAKE_FLAGS: ${{ steps.meta.outputs.extra_cmake_flags }}
+        run: |
+          export PATH="/usr/lib/ccache:$PATH"
+          export EXT_RELEASE_FLAGS="$EXTRA_CMAKE_FLAGS"
+          if [ "$USE_VCPKG" = "true" ]; then
+            export VCPKG_TOOLCHAIN_PATH="${GITHUB_WORKSPACE}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+            export VCPKG_TARGET_TRIPLET="$VCPKG_TRIPLET"
+            export VCPKG_HOST_TRIPLET="$VCPKG_TRIPLET"
+          else
+            unset VCPKG_ROOT VCPKG_TOOLCHAIN_PATH VCPKG_INSTALLATION_ROOT
+          fi
+          make release
+
+      - name: Verify ABI, guarded CRUD symbols, dynamic deps, and package release asset
+        id: pkg
+        env:
+          EXT_NAME: ${{ steps.meta.outputs.ext_name }}
+          REL_TAG: ${{ steps.meta.outputs.release_tag }}
+          REQUIRED_SYMBOL: ${{ steps.meta.outputs.required_symbol }}
+          REQUIRE_LIBODBC: ${{ steps.meta.outputs.require_libodbc }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ext_bin="build/release/extension/${EXT_NAME}/${EXT_NAME}.duckdb_extension"
+          if [ ! -f "$ext_bin" ]; then
+            ext_bin="$(find build/release -type f -name "${EXT_NAME}.duckdb_extension" -print -quit)"
+          fi
+          test -s "$ext_bin"
+
+          missing="$(ldd "$ext_bin" | awk '/not found/{print}' || true)"
+          if [ -n "$missing" ]; then
+            echo "Missing shared libraries in $ext_bin: $missing"
+            exit 1
+          fi
+          if [ "$REQUIRE_LIBODBC" = "true" ]; then
+            ldd "$ext_bin" | grep -q 'libodbc\.so\.2'
+          fi
+
+          strings "$ext_bin" | grep -q "$REQUIRED_SYMBOL"
+
+          footer="$(tail -c 512 "$ext_bin" | tr '\0' '\n')"
+          grep -q 'v2.0.0' <<< "$footer"
+          grep -q 'linux_amd64' <<< "$footer"
+
+          mkdir -p dist
+          raw_asset="dist/${EXT_NAME}-v2.0.0-linux_amd64.duckdb_extension"
+          gz_asset="${raw_asset}.gz"
+          cp "$ext_bin" "$raw_asset"
+          gzip -n -9 -c "$raw_asset" > "$gz_asset"
+
+          raw_sha="$(sha256sum "$raw_asset" | awk '{print $1}')"
+          gz_sha="$(sha256sum "$gz_asset" | awk '{print $1}')"
+          (
+            cd dist
+            sha256sum "$(basename "$raw_asset")" "$(basename "$gz_asset")" > SHA256SUMS.txt
+          )
+
+          RAW_SHA="$raw_sha" GZ_SHA="$gz_sha" python3 - <<'PY'
+          import json, os, pathlib
+          meta = {
+              'repository': os.environ['REPO_NAME'],
+              'extension_name': os.environ['EXT_NAME'],
+              'release_tag': os.environ['REL_TAG'],
+              'commit_sha': os.environ['COMMIT_SHA'],
+              'duckdb_version': 'v2.0.0',
+              'platform': 'linux_amd64',
+              'asset': f"{os.environ['EXT_NAME']}-v2.0.0-linux_amd64.duckdb_extension.gz",
+              'uncompressed_sha256': os.environ['RAW_SHA'],
+              'compressed_sha256': os.environ['GZ_SHA'],
+          }
+          pathlib.Path('dist/release-metadata.json').write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')
+          PY
+          echo "raw_sha=$raw_sha" >> "$GITHUB_OUTPUT"
+          echo "gz_asset=$gz_asset" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable GitHub Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          COMMIT_SHA: ${{ github.sha }}
+          REL_TAG: ${{ steps.meta.outputs.release_tag }}
+          EXT_NAME: ${{ steps.meta.outputs.ext_name }}
+          GZ_ASSET: ${{ steps.pkg.outputs.gz_asset }}
+        run: |
+          extra=()
+          if [ "$REF_TYPE" != "tag" ]; then
+            extra+=(--target "$COMMIT_SHA")
+          fi
+          gh release delete "$REL_TAG" --yes >/dev/null 2>&1 || true
+          gh release create "$REL_TAG" \
+            "$GZ_ASSET" \
+            dist/SHA256SUMS.txt \
+            dist/release-metadata.json \
+            "${extra[@]}" \
+            --title "${EXT_NAME} ${REL_TAG}" \
+            --notes "Custom DuckDB v2.0.0 extension build for linux_amd64 (${EXT_NAME})."
