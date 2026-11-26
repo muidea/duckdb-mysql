@@ -4,6 +4,7 @@
 #include <tuple>
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "storage/mysql_schema_entry.hpp"
 #include "storage/mysql_transaction.hpp"
@@ -322,6 +323,11 @@ MYSQL *MySQLUtils::Connect(const string &dsn, const string &attach_path) {
 		mysql_close(mysql);
 		throw IOException("%s", diagnostic);
 	}
+	if (mysql_query(mysql, "SET time_zone='+00:00'") != 0) {
+		auto diagnostic = MySQLQueryErrorMessage(mysql, nullptr, "source_connect");
+		mysql_close(mysql);
+		throw IOException("%s", diagnostic);
+	}
 	D_ASSERT(mysql == result);
 	return result;
 }
@@ -376,7 +382,8 @@ string MySQLUtils::TransformConstant(const Value &val) {
 		return TransformBlobToMySQL(StringValue::Get(val));
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+		auto ts_utc = timestamp_t(TimestampTZValue::Get(val).value);
+		return MySQLUtils::WriteLiteral(Timestamp::ToString(ts_utc));
 	}
 	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
 }

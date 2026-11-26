@@ -157,16 +157,274 @@ struct MySQLRenameDefinition {
 		Invalid();
 		return {};
 	}
+	static std::string NormalizeBooleanForModify(const std::string &def) {
+		auto tokens = TokenizeTopLevel(def);
+		if (tokens.size() >= 2 && tokens[0].is_word && tokens[0].start == 0 && tokens[0].upper == "TINYINT" &&
+		    tokens[1].is_paren && tokens[1].start == tokens[0].end &&
+		    def.substr(tokens[1].start, tokens[1].end - tokens[1].start) == "(1)") {
+			if (tokens.size() <= 2 || !tokens[2].is_word ||
+			    (tokens[2].upper != "UNSIGNED" && tokens[2].upper != "ZEROFILL")) {
+				return "BOOLEAN" + def.substr(tokens[1].end);
+			}
+		}
+		return def;
+	}
 	std::string Change(const std::string &schema, const std::string &table, const std::string &old_name,
 	                   const std::string &new_name) const {
 		for (auto &column : columns) {
 			if (column.name == old_name) {
 				return "ALTER TABLE " + Quote(schema) + "." + Quote(table) + " CHANGE COLUMN " + Quote(old_name) +
-				       " " + Quote(new_name) + " " + column.definition;
+				       " " + Quote(new_name) + " " + NormalizeBooleanForModify(column.definition);
 			}
 		}
 		Invalid();
 		return {};
+	}
+	std::string Modify(const std::string &schema, const std::string &table, const std::string &column_name) const {
+		for (auto &column : columns) {
+			if (column.name == column_name) {
+				return "ALTER TABLE " + Quote(schema) + "." + Quote(table) + " MODIFY COLUMN " + Quote(column_name) +
+				       " " + NormalizeBooleanForModify(column.definition);
+			}
+		}
+		Invalid();
+		return {};
+	}
+	struct DefToken {
+		size_t start;
+		size_t end;
+		std::string upper;
+		bool is_word;
+		bool is_paren;
+	};
+	static std::vector<DefToken> TokenizeTopLevel(const std::string &s) {
+		std::vector<DefToken> tokens;
+		for (size_t p = 0; p < s.size();) {
+			if (Space(s[p])) {
+				p++;
+				continue;
+			}
+			char c = s[p];
+			if (c == '\'' || c == '"' || c == '`') {
+				size_t start = p++;
+				char quote = c;
+				while (p < s.size()) {
+					if (s[p] == '\\' && quote != '`') {
+						if (++p == s.size()) {
+							Invalid();
+						}
+						p++;
+					} else if (s[p] == quote) {
+						p++;
+						if (p < s.size() && s[p] == quote) {
+							p++;
+						} else {
+							break;
+						}
+					} else {
+						p++;
+					}
+				}
+				tokens.push_back({start, p, "", false, false});
+			} else if (c == '/' && p + 1 < s.size() && s[p + 1] == '*') {
+				size_t start = p;
+				bool conditional = p + 2 < s.size() && s[p + 2] == '!';
+				p += 2;
+				bool closed = false;
+				while (p + 1 < s.size()) {
+					if (s[p] == '*' && s[p + 1] == '/') {
+						p += 2;
+						closed = true;
+						break;
+					}
+					p++;
+				}
+				if (!closed) {
+					Invalid();
+				}
+				tokens.push_back({start, p, conditional ? "/*!" : "", false, false});
+			} else if (c == '(') {
+				size_t start = p++;
+				int depth = 1;
+				char quote = 0;
+				bool comment = false;
+				for (; p < s.size() && depth > 0; p++) {
+					char ch = s[p];
+					if (comment) {
+						if (ch == '*' && p + 1 < s.size() && s[p + 1] == '/') {
+							comment = false;
+							p++;
+						}
+					} else if (quote) {
+						if (ch == '\\' && quote != '`') {
+							if (++p == s.size()) {
+								Invalid();
+							}
+						} else if (ch == quote) {
+							if (p + 1 < s.size() && s[p + 1] == quote) {
+								p++;
+							} else {
+								quote = 0;
+							}
+						}
+					} else if (ch == '\'' || ch == '"' || ch == '`') {
+						quote = ch;
+					} else if (ch == '/' && p + 1 < s.size() && s[p + 1] == '*') {
+						comment = true;
+						p++;
+					} else if (ch == '(') {
+						if (++depth > 256) {
+							Invalid();
+						}
+					} else if (ch == ')') {
+						depth--;
+					}
+				}
+				if (depth != 0) {
+					Invalid();
+				}
+				tokens.push_back({start, p, "", false, true});
+			} else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+				size_t start = p;
+				std::string up;
+				while (p < s.size() && ((s[p] >= 'a' && s[p] <= 'z') || (s[p] >= 'A' && s[p] <= 'Z') ||
+				                        (s[p] >= '0' && s[p] <= '9') || s[p] == '_')) {
+					char ch = s[p++];
+					if (ch >= 'a' && ch <= 'z') {
+						ch = static_cast<char>(ch - 'a' + 'A');
+					}
+					up += ch;
+				}
+				tokens.push_back({start, p, up, true, false});
+			} else {
+				size_t start = p++;
+				tokens.push_back({start, p, "", false, false});
+			}
+		}
+		return tokens;
+	}
+	void SetNullability(const std::string &column_name, bool not_null) {
+		for (auto &column : columns) {
+			if (column.name != column_name) {
+				continue;
+			}
+			std::string s = column.definition;
+			if (not_null) {
+				for (;;) {
+					auto next = WithoutNullDefault(s);
+					if (next == s) {
+						break;
+					}
+					s = next;
+				}
+			}
+			auto tokens = TokenizeTopLevel(s);
+			if (tokens.empty() || !tokens[0].is_word) {
+				Invalid();
+			}
+			size_t idx = 1;
+			if (idx < tokens.size() && tokens[idx].is_paren) {
+				idx++;
+			}
+			while (idx < tokens.size() && tokens[idx].is_word) {
+				if (tokens[idx].upper == "UNSIGNED" || tokens[idx].upper == "ZEROFILL") {
+					idx++;
+				} else if (tokens[idx].upper == "CHARACTER" && idx + 2 < tokens.size() &&
+				           tokens[idx + 1].upper == "SET" && tokens[idx + 2].is_word) {
+					idx += 3;
+				} else if (tokens[idx].upper == "CHARSET" && idx + 1 < tokens.size() && tokens[idx + 1].is_word) {
+					idx += 2;
+				} else if (tokens[idx].upper == "COLLATE" && idx + 1 < tokens.size() && tokens[idx + 1].is_word) {
+					idx += 2;
+				} else {
+					break;
+				}
+			}
+			// Remove existing standalone top-level NOT NULL / NULL tokens (never touching DEFAULT NULL).
+			std::vector<std::pair<size_t, size_t>> remove_spans;
+			for (size_t t = idx; t < tokens.size(); t++) {
+				if (tokens[t].is_word && tokens[t].upper == "NOT" && t + 1 < tokens.size() &&
+				    tokens[t + 1].is_word && tokens[t + 1].upper == "NULL") {
+					remove_spans.push_back({tokens[t].start, tokens[t + 1].end});
+					t++;
+				} else if (tokens[t].is_word && tokens[t].upper == "NULL" &&
+				           !(t > 0 && tokens[t - 1].is_word && tokens[t - 1].upper == "DEFAULT")) {
+					remove_spans.push_back({tokens[t].start, tokens[t].end});
+				}
+			}
+			const size_t insert_pos = tokens[idx - 1].end;
+			std::string out = s.substr(0, insert_pos);
+			out += (not_null ? " NOT NULL" : " NULL");
+			size_t cursor = insert_pos;
+			for (auto &span : remove_spans) {
+				if (span.first > cursor) {
+					std::string gap = s.substr(cursor, span.first - cursor);
+					// Trim trailing space directly before the removed keyword.
+					while (!gap.empty() && Space(gap.back())) {
+						gap.pop_back();
+					}
+					out += gap;
+				}
+				cursor = span.second;
+			}
+			if (cursor < s.size()) {
+				out += s.substr(cursor);
+			}
+			column.definition = out;
+			return;
+		}
+		Invalid();
+	}
+	void ReplaceType(const std::string &column_name, const std::string &new_native_type) {
+		for (auto &column : columns) {
+			if (column.name != column_name) {
+				continue;
+			}
+			const auto &s = column.definition;
+			auto tokens = TokenizeTopLevel(s);
+			if (tokens.empty() || !tokens[0].is_word || tokens[0].start != 0) {
+				Invalid();
+			}
+			const auto &base = tokens[0].upper;
+			if (base != "SMALLINT" && base != "INT" && base != "INTEGER" && base != "FLOAT" &&
+			    base != "DECIMAL" && base != "VARCHAR" && base != "DATETIME" && base != "TIMESTAMP" &&
+			    base != "TIME") {
+				Invalid();
+			}
+			size_t next_idx = 1;
+			size_t type_end = tokens[0].end;
+			if (next_idx < tokens.size() && tokens[next_idx].is_paren && tokens[next_idx].start == type_end) {
+				type_end = tokens[next_idx].end;
+				next_idx++;
+			}
+			if (next_idx < tokens.size() && tokens[next_idx].is_word &&
+			    (tokens[next_idx].upper == "UNSIGNED" || tokens[next_idx].upper == "ZEROFILL")) {
+				Invalid();
+			}
+			if (type_end < s.size() && !Space(s[type_end])) {
+				Invalid();
+			}
+			column.definition = new_native_type + s.substr(type_end);
+			return;
+		}
+		Invalid();
+	}
+	bool PreservedOtherColumns(const MySQLRenameDefinition &after, const std::string &target_column) const {
+		if (columns.size() != after.columns.size()) {
+			return false;
+		}
+		bool found = false;
+		for (size_t i = 0; i < columns.size(); i++) {
+			if (columns[i].name != after.columns[i].name) {
+				return false;
+			}
+			if (columns[i].name == target_column) {
+				found = true;
+			} else if (columns[i].definition != after.columns[i].definition) {
+				return false;
+			}
+		}
+		return found;
 	}
 	void StringDefault(const std::string &column_name, const std::string &charset, const std::string &hex) {
 		if (charset.empty() || charset.size() > 64 || hex.size() > MAX_BYTES || hex.size() % 2) {

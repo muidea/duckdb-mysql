@@ -75,6 +75,10 @@ void MySQLConnectionPool::ResetConnection(MySQLConnection &conn) {
 	if (strcmp(charset, "utf8mb4") != 0) {
 		throw IOException("Character set verification failed: expected utf8mb4, got %s", charset);
 	}
+
+	if (mysql_query(mysql_conn, "SET time_zone='+00:00'") != 0) {
+		throw IOException("%s", MySQLQueryErrorMessage(mysql_conn, nullptr, "source_connect"));
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -220,7 +224,7 @@ MySQLPooledConnection MySQLConnectionPool::Acquire(dbconnector::pool::AcquireMod
 		break;
 	}
 
-	if (!time_zone.empty()) {
+	if (!time_zone.empty() && time_zone != "+00:00") {
 		try {
 			pc->Execute("SET TIME_ZONE = ?", {Value(time_zone)});
 		} catch (...) {

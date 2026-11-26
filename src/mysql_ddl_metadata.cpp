@@ -167,7 +167,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		bool distribution =
 		    ((comment == "Ubuntu" || comment == "(Ubuntu)") && version.find("ubuntu") != string::npos) ||
 		    ((comment == "Debian" || comment == "(Debian)") && version.find("debian") != string::npos);
-		if (((mariadb && comment.find("MariaDB") == string::npos) ||
+		if (((mariadb && comment.find("MariaDB") == string::npos && version.find("MariaDB") == string::npos) ||
 		     (!mariadb && !distribution && comment.find("MySQL") == string::npos)) ||
 		    Scalar(c, "SELECT DATABASE()") != d.schema) {
 			error = "0A000";

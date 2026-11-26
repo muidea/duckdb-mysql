@@ -288,7 +288,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          " connections to MySQL server",
 	                          LogicalType::VARCHAR, Value(""), MySQLClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("mysql_time_as_time", "Whether or not to convert MySQL's TIME columns to DuckDB's TIME",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false),
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true),
 	                          MySQLClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("mysql_incomplete_dates_as_nulls",
 	                          "Whether to return DATEs with zero month or day as NULLs", LogicalType::BOOLEAN,

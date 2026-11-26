@@ -7,6 +7,14 @@
 // field. This initial native surface intentionally excludes conditional DDL,
 // ONLY/inheritance, implicit column attributes and non-equivalent conversions.
 namespace duckdb {
+struct DDLColumnSpec {
+	string name, type;
+	int32_t length = 0, precision = 0, scale = 0;
+	bool not_null = false;
+	string default_kind, default_value;
+	bool primary_key = false;
+};
+
 struct GuardedDDLIntent {
 	int32_t contract_version = 2;
 	string database, schema, operation, action, name, index, owner, new_name, column_name, sql;
@@ -14,7 +22,13 @@ struct GuardedDDLIntent {
 	string default_kind, default_value, constraint_name, constraint_kind, check_column, check_operator, check_value,
 	    reference_schema, reference_table, identity_mode;
 	vector<string> constraint_keys, reference_keys;
+	vector<DDLColumnSpec> column_specs;
+	bool conditional = false;
+	string primary_key_name;
+	vector<string> primary_key_keys;
 	static GuardedDDLIntent BindV4(const vector<Value> &input, bool mysql);
+	static GuardedDDLIntent BindV6(const vector<Value> &input, bool mysql);
+	static string ColumnTypeV6(const string &type, int32_t length, int32_t precision, int32_t scale, bool mysql);
 	static string ColumnTypeV5(const string &type, int32_t length, int32_t precision, int32_t scale, bool mysql) {
 		if (type == "numeric") {
 			if (length || precision < 1 || precision > (mysql ? 65 : 38) || scale < 0 || scale > precision ||
@@ -58,6 +72,8 @@ struct GuardedDDLIntent {
 	static GuardedDDLIntent Bind(const vector<Value> &input, bool mysql, int32_t contract = 2) {
 		if (contract == 4)
 			return BindV4(input, mysql);
+		if (contract == 6)
+			return BindV6(input, mysql);
 		if (input.size() != 5)
 			throw BinderException("DDL structured input is invalid");
 		GuardedDDLIntent d;
@@ -225,3 +241,4 @@ struct GuardedDDLIntent {
 } // namespace duckdb
 
 #include "guarded_ddl_v4.hpp"
+#include "guarded_ddl_v6.hpp"

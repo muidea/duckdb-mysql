@@ -47,7 +47,9 @@ static void FillTimeBuffer(Value &value, vector<char> &bind_buffer) {
 static void FillTimestampBuffer(Value &value, vector<char> &bind_buffer) {
 	MYSQL_TIME mt;
 	std::memset(&mt, '\0', sizeof(MYSQL_TIME));
-	timestamp_t ts = TimestampValue::Get(value);
+	timestamp_t ts = value.type().id() == LogicalTypeId::TIMESTAMP_TZ
+	                     ? timestamp_t(TimestampTZValue::Get(value).value)
+	                     : TimestampValue::Get(value);
 	date_t dd;
 	dtime_t dt;
 	Timestamp::Convert(ts, dd, dt);

@@ -1,4 +1,5 @@
 #include "mysql_types.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include <iostream>
 #include <stdexcept>
 
@@ -138,5 +139,30 @@ int main() {
 		}
 		Require(rejected);
 	}
+	MySQLTypeConfig time_cfg;
+	time_cfg.time_as_time = true;
+	Require(MySQLTypes::TypeToLogicalType(time_cfg, {"timestamp", "timestamp(6)"}) == LogicalType::TIMESTAMP_TZ);
+	Require(MySQLTypes::TypeToLogicalType(time_cfg, {"datetime", "datetime(6)"}) == LogicalType::TIMESTAMP);
+	Require(MySQLTypes::TypeToLogicalType(time_cfg, {"time", "time(6)"}) == LogicalType::TIME);
+	Require(MySQLTypes::TypeToLogicalType(config, {"time", "time(6)"}) == LogicalType::VARCHAR);
+	Require(decode(LogicalType::TIME, "00:00:00", MYSQL_TYPE_TIME).ToString() == "00:00:00");
+	Require(decode(LogicalType::TIME, "12:34:56.123456", MYSQL_TYPE_TIME).ToString() == "12:34:56.123456");
+	Require(decode(LogicalType::TIME, "23:59:59.999999", MYSQL_TYPE_TIME).ToString() == "23:59:59.999999");
+	Require(decode(LogicalType::TIME, "24:00:00", MYSQL_TYPE_TIME).ToString() == "24:00:00");
+	for (const auto &bad_time : {"-01:30:00", "-00:00:01", "24:00:01", "24:00:00.000001", "25:00:00", "838:59:59",
+	                             "-838:59:59.123456", "", "12:60:00", "12:00:60"}) {
+		bool rejected = false;
+		try {
+			decode(LogicalType::TIME, bad_time, MYSQL_TYPE_TIME);
+		} catch (const Exception &) {
+			rejected = true;
+		}
+		Require(rejected);
+	}
+	Require(decode(LogicalType::TIMESTAMP_TZ, "0000-00-00 00:00:00", MYSQL_TYPE_TIMESTAMP).IsNull());
+	Require(decode(LogicalType::TIMESTAMP_TZ, "0000-00-00 00:00:00.000000", MYSQL_TYPE_TIMESTAMP).IsNull());
+	auto tstz_val = decode(LogicalType::TIMESTAMP_TZ, "2026-05-01 12:34:56.123456", MYSQL_TYPE_TIMESTAMP);
+	Require(!tstz_val.IsNull() && tstz_val.type() == LogicalType::TIMESTAMP_TZ);
+	Require(TimestampTZValue::Get(tstz_val).value == Timestamp::FromString("2026-05-01 12:34:56.123456", false).value);
 	std::cout << "typed text-protocol precision tests passed\n";
 }
