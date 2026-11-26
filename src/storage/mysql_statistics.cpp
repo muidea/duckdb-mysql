@@ -1,6 +1,8 @@
 #include "storage/mysql_statistics.hpp"
 #include "mysql_connection.hpp"
 #include "mysql_result.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "yyjson.hpp"
 
 namespace duckdb {
@@ -179,7 +181,16 @@ optional_ptr<const MySQLIndexInfo> MySQLTableStats::FindCoveringIndex(const vect
 vector<string> MySQLPartitionInfo::GetMatchingPartitions(const Value &filter_value, ExpressionType comparison) const {
 	vector<string> matching;
 
-	if (!IsRangeOrList() || partitions.empty()) {
+	if (!IsRangeOrList() || partitions.empty() || filter_value.IsNull()) {
+		return matching;
+	}
+	if (filter_value.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
+		return matching;
+	}
+	if (filter_value.type().id() == LogicalTypeId::DATE && !Date::IsFinite(DateValue::Get(filter_value))) {
+		return matching;
+	}
+	if (filter_value.type().id() == LogicalTypeId::TIMESTAMP && !Timestamp::IsFinite(TimestampValue::Get(filter_value))) {
 		return matching;
 	}
 
@@ -207,8 +218,24 @@ vector<string> MySQLPartitionInfo::GetMatchingPartitions(const Value &filter_val
 						return {};
 					}
 				} else {
+					string desc = part.description;
+					StringUtil::Trim(desc);
+					if (desc.empty()) {
+						return {};
+					}
+					bool in_quote = false;
+					for (idx_t pos = 0; pos < desc.size(); pos++) {
+						if (desc[pos] == '\'') {
+							in_quote = !in_quote;
+						} else if (desc[pos] == ',' && !in_quote) {
+							return {};
+						}
+					}
+					if (desc.size() >= 2 && desc.front() == '\'' && desc.back() == '\'') {
+						desc = desc.substr(1, desc.size() - 2);
+					}
 					try {
-						bound = Value(part.description).DefaultCastAs(filter_value.type());
+						bound = Value(desc).DefaultCastAs(filter_value.type());
 					} catch (const std::exception &) {
 						return {};
 					}

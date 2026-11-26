@@ -1,5 +1,6 @@
 #include "mysql_source_error.hpp"
 #include "mysql_connection_pool.hpp"
+#include "mysql_temporal_utils.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -208,6 +209,11 @@ dbconnector::pool::ConnectionPoolConfig MySQLConnectionPool::CreateConfig(Client
 
 MySQLPooledConnection MySQLConnectionPool::Acquire(dbconnector::pool::AcquireMode acquire_mode,
                                                    const std::string &time_zone) {
+	if (!IsAllowedMySQLSessionTimeZone(time_zone)) {
+		throw InvalidInputException(
+		    "mysql_session_time_zone must remain UTC ('+00:00' or empty); non-UTC session time zones would diverge "
+		    "from UTC TIMESTAMP encoding. Set DuckDB/client TimeZone instead.");
+	}
 	MySQLPooledConnection pc;
 	switch (acquire_mode) {
 	case dbconnector::pool::AcquireMode::FORCE:
@@ -222,15 +228,6 @@ MySQLPooledConnection MySQLConnectionPool::Acquire(dbconnector::pool::AcquireMod
 			throw IOException("Connection pool exhausted: no connections available (try mode)");
 		}
 		break;
-	}
-
-	if (!time_zone.empty() && time_zone != "+00:00") {
-		try {
-			pc->Execute("SET TIME_ZONE = ?", {Value(time_zone)});
-		} catch (...) {
-			pc.Invalidate();
-			throw;
-		}
 	}
 
 	return pc;

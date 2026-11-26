@@ -88,9 +88,10 @@ string PredicateAnalyzer::TransformFilterToMySQL(const string &column_name, Tabl
 		vector<string> child_predicates;
 		for (const auto &child : conjunction.child_filters) {
 			auto pred = TransformFilterToMySQL(column_name, *child);
-			if (!pred.empty()) {
-				child_predicates.push_back(pred);
+			if (pred.empty()) {
+				return "";
 			}
+			child_predicates.push_back(pred);
 		}
 		return CreateConjunction(child_predicates, "AND");
 	}
@@ -99,15 +100,19 @@ string PredicateAnalyzer::TransformFilterToMySQL(const string &column_name, Tabl
 		vector<string> child_predicates;
 		for (const auto &child : conjunction.child_filters) {
 			auto pred = TransformFilterToMySQL(column_name, *child);
-			if (!pred.empty()) {
-				child_predicates.push_back(pred);
+			if (pred.empty()) {
+				return "";
 			}
+			child_predicates.push_back(pred);
 		}
 		return CreateConjunction(child_predicates, "OR");
 	}
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &constant_filter = filter.Cast<ConstantFilter>();
-		auto constant_string = MySQLUtils::TransformConstant(constant_filter.constant);
+		string constant_string;
+		if (!MySQLUtils::TryTransformConstant(constant_filter.constant, constant_string)) {
+			return "";
+		}
 		auto operator_string = TransformComparisonOperator(constant_filter.comparison_type);
 		if (operator_string.empty()) {
 			return "";
@@ -125,10 +130,14 @@ string PredicateAnalyzer::TransformFilterToMySQL(const string &column_name, Tabl
 		}
 		string in_list;
 		for (const auto &val : in_filter.values) {
+			string constant_string;
+			if (!MySQLUtils::TryTransformConstant(val, constant_string)) {
+				return "";
+			}
 			if (!in_list.empty()) {
 				in_list += ", ";
 			}
-			in_list += MySQLUtils::TransformConstant(val);
+			in_list += constant_string;
 		}
 		return col_escaped + " IN (" + in_list + ")";
 	}

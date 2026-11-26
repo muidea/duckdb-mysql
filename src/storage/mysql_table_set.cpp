@@ -358,7 +358,8 @@ void MySQLTableSet::AlterTable(ClientContext &context, AddColumnInfo &info) {
 	}
 	sql += MySQLUtils::WriteIdentifier(info.new_column.Name());
 	sql += " ";
-	sql += info.new_column.Type().ToString();
+	MySQLTypeConfig type_config(context);
+	sql += MySQLTypes::TypeToString(MySQLTypes::ToMySQLType(type_config, info.new_column.Type()));
 	transaction.Query(sql);
 }
 

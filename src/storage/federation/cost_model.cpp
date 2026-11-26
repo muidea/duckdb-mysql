@@ -320,11 +320,26 @@ ExecutionPlan DefaultCostModel::ComparePlans(const MySQLTableStats &stats, const
 	plan.comparison_costs.local_all_cost = local_all_cost;
 	plan.comparison_costs.hybrid_cost = hybrid_cost;
 
-	ExecutionStrategy best_strategy = ExecutionStrategy::PUSH_ALL_FILTERS;
-	OperationCost best_cost = push_all_cost;
-	if (local_all_cost < best_cost) {
+	bool has_unpushable = false;
+	for (const auto &analysis : filter_result.analyses) {
+		if (analysis.mysql_predicate.empty()) {
+			has_unpushable = true;
+			break;
+		}
+	}
+
+	ExecutionStrategy best_strategy;
+	OperationCost best_cost;
+	if (has_unpushable) {
 		best_strategy = ExecutionStrategy::EXECUTE_ALL_LOCALLY;
 		best_cost = local_all_cost;
+	} else {
+		best_strategy = ExecutionStrategy::PUSH_ALL_FILTERS;
+		best_cost = push_all_cost;
+		if (local_all_cost < best_cost) {
+			best_strategy = ExecutionStrategy::EXECUTE_ALL_LOCALLY;
+			best_cost = local_all_cost;
+		}
 	}
 
 	if (!hybrid_pushed.empty() && !hybrid_local.empty() && hybrid_cost < best_cost) {

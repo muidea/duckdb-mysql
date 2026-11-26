@@ -10,7 +10,7 @@ string MySQLFilterPushdown::CreateExpression(string &column_name, vector<unique_
 	for (auto &filter : filters) {
 		auto new_filter = TransformFilter(column_name, *filter);
 		if (new_filter.empty()) {
-			continue;
+			return string();
 		}
 		filter_entries.push_back(std::move(new_filter));
 	}
@@ -55,7 +55,10 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 	}
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &constant_filter = filter.Cast<ConstantFilter>();
-		auto constant_string = MySQLUtils::TransformConstant(constant_filter.constant);
+		string constant_string;
+		if (!MySQLUtils::TryTransformConstant(constant_filter.constant, constant_string)) {
+			return string();
+		}
 		auto operator_string = TransformComparison(constant_filter.comparison_type);
 		return StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	}
@@ -68,12 +71,19 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 	}
 	case TableFilterType::IN_FILTER: {
 		auto &in_filter = filter.Cast<InFilter>();
+		if (in_filter.values.empty()) {
+			return string();
+		}
 		string in_list;
 		for (auto &val : in_filter.values) {
+			string constant_string;
+			if (!MySQLUtils::TryTransformConstant(val, constant_string)) {
+				return string();
+			}
 			if (!in_list.empty()) {
 				in_list += ", ";
 			}
-			in_list += MySQLUtils::TransformConstant(val);
+			in_list += constant_string;
 		}
 		return column_name + " IN (" + in_list + ")";
 	}
@@ -83,17 +93,27 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 }
 
 string MySQLFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
-                                             const vector<string> &names) {
+                                             const vector<string> &names, vector<column_t> *unpushed_columns) {
 	if (!filters || filters->filters.empty()) {
 		// no filters
 		return string();
 	}
 	string result;
 	for (auto &entry : filters->filters) {
-		auto column_name = MySQLUtils::WriteIdentifier(names[column_ids[entry.first]]);
+		auto col_idx = column_ids[entry.first];
+		if (col_idx == COLUMN_IDENTIFIER_ROW_ID || col_idx >= names.size()) {
+			if (unpushed_columns) {
+				unpushed_columns->push_back(entry.first);
+			}
+			continue;
+		}
+		auto column_name = MySQLUtils::WriteIdentifier(names[col_idx]);
 		auto &filter = *entry.second;
 		auto new_filter = TransformFilter(column_name, filter);
 		if (new_filter.empty()) {
+			if (unpushed_columns) {
+				unpushed_columns->push_back(entry.first);
+			}
 			continue;
 		}
 		if (!result.empty()) {

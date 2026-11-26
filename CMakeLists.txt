@@ -39,9 +39,16 @@ if(MYSQL_BUILD_RESOURCE_TESTS)
                              PRIVATE src/include ${MYSQL_INCLUDE_DIR})
   target_link_libraries(mysql_statistics_cache_resource_test
                         duckdb duckdb_yyjson ${MYSQL_LIBRARIES})
+  add_executable(mysql_temporal_behavior_test
+                 test/temporal_behavior_test.cpp ${ALL_OBJECT_FILES})
+  target_include_directories(mysql_temporal_behavior_test
+                             PRIVATE src/include ${MYSQL_INCLUDE_DIR})
+  target_link_libraries(mysql_temporal_behavior_test
+                        duckdb duckdb_yyjson ${MYSQL_LIBRARIES})
   enable_testing()
   add_test(NAME mysql_column_rename_definition COMMAND mysql_column_rename_definition_test)
   add_test(NAME mysql_plan_cache_resources COMMAND mysql_plan_cache_resource_test)
   add_test(NAME mysql_statistics_cache_resources COMMAND mysql_statistics_cache_resource_test)
   add_test(NAME mysql_decimal_types COMMAND mysql_decimal_type_test)
+  add_test(NAME mysql_temporal_behavior COMMAND mysql_temporal_behavior_test)
 endif()
