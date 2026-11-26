@@ -162,7 +162,10 @@ static string TransformExprToMySQL(const string &col_escaped, const Expression &
 	ExpressionType cmp_type;
 	const Value *constant = nullptr;
 	if (ExtractComparisonConstant(expr, cmp_type, constant)) {
-		auto constant_string = MySQLUtils::TransformConstant(*constant);
+		string constant_string;
+		if (!MySQLUtils::TryTransformConstant(*constant, constant_string)) {
+			return "";
+		}
 		auto operator_string = cmp_op_fn(cmp_type);
 		if (operator_string.empty()) {
 			return "";
@@ -176,9 +179,10 @@ static string TransformExprToMySQL(const string &col_escaped, const Expression &
 		vector<string> parts;
 		for (const auto &child : conj.GetChildren()) {
 			auto pred = TransformExprToMySQL(col_escaped, *child, cmp_op_fn);
-			if (!pred.empty()) {
-				parts.push_back(std::move(pred));
+			if (pred.empty()) {
+				return "";
 			}
+			parts.push_back(std::move(pred));
 		}
 		if (parts.empty()) {
 			return "";
@@ -208,10 +212,15 @@ static string TransformExprToMySQL(const string &col_escaped, const Expression &
 				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 					return "";
 				}
+				string constant_string;
+				if (!MySQLUtils::TryTransformConstant(children[i]->Cast<BoundConstantExpression>().GetValue(),
+				                                      constant_string)) {
+					return "";
+				}
 				if (!in_list.empty()) {
 					in_list += ", ";
 				}
-				in_list += MySQLUtils::TransformConstant(children[i]->Cast<BoundConstantExpression>().GetValue());
+				in_list += constant_string;
 			}
 			return col_escaped + " IN (" + in_list + ")";
 		}

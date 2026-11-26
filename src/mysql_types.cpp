@@ -1,5 +1,7 @@
 #include "mysql_types.hpp"
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 namespace duckdb {
 
@@ -43,7 +45,8 @@ Value MySQLTypes::DecodeTextValue(const MySQLTypeConfig &config, const LogicalTy
 		}
 		throw ConversionException("Invalid MySQL boolean text-protocol value");
 	}
-	if (type.id() == LogicalTypeId::DATE || type.id() == LogicalTypeId::TIMESTAMP) {
+	if (type.id() == LogicalTypeId::DATE || type.id() == LogicalTypeId::TIMESTAMP ||
+	    type.id() == LogicalTypeId::TIMESTAMP_TZ) {
 		bool zero = text == "0000-00-00" || text == "0000-00-00 00:00:00" ||
 		            (text.size() > 20 && text.substr(0, 20) == "0000-00-00 00:00:00." &&
 		             text.find_first_not_of('0', 20) == string::npos);
@@ -52,6 +55,62 @@ Value MySQLTypes::DecodeTextValue(const MySQLTypeConfig &config, const LogicalTy
 		if (zero || (config.incomplete_dates_as_nulls && incomplete)) {
 			return Value(type);
 		}
+		if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			timestamp_t ts;
+			if (Timestamp::TryConvertTimestamp(text.c_str(), text.size(), ts, false) != TimestampCastResult::SUCCESS) {
+				throw ConversionException("Invalid MySQL timestamp text-protocol value: " + text);
+			}
+			return Value::TIMESTAMPTZ(timestamp_tz_t(ts.value));
+		}
+	}
+	if (type.id() == LogicalTypeId::TIME) {
+		if (text.empty() || text[0] == '-' || text[0] == '+') {
+			throw ConversionException("MySQL TIME text-protocol value out of range for TIME: " + text);
+		}
+		auto digits_only = [&](idx_t start, idx_t end) {
+			if (start >= end) {
+				return false;
+			}
+			for (idx_t p = start; p < end; p++) {
+				if (text[p] < '0' || text[p] > '9') {
+					return false;
+				}
+			}
+			return true;
+		};
+		auto c1 = text.find(':');
+		auto c2 = c1 == string::npos ? string::npos : text.find(':', c1 + 1);
+		if (c1 == string::npos || c2 == string::npos || c1 == 0 || c2 - c1 - 1 != 2) {
+			throw ConversionException("Invalid MySQL TIME text-protocol value: " + text);
+		}
+		auto dot = text.find('.', c2 + 1);
+		idx_t sec_end = dot == string::npos ? text.size() : dot;
+		if (sec_end - c2 - 1 != 2 || !digits_only(0, c1) || !digits_only(c1 + 1, c2) || !digits_only(c2 + 1, sec_end)) {
+			throw ConversionException("Invalid MySQL TIME text-protocol value: " + text);
+		}
+		if (c1 != 2) {
+			throw ConversionException("MySQL TIME text-protocol value out of range for TIME: " + text);
+		}
+		int32_t hour = (text[0] - '0') * 10 + (text[1] - '0');
+		int32_t minute = (text[c1 + 1] - '0') * 10 + (text[c1 + 2] - '0');
+		int32_t second = (text[c2 + 1] - '0') * 10 + (text[c2 + 2] - '0');
+		int32_t micros = 0;
+		if (dot != string::npos) {
+			idx_t flen = text.size() - (dot + 1);
+			if (flen == 0 || flen > 6 || !digits_only(dot + 1, text.size())) {
+				throw ConversionException("Invalid MySQL TIME text-protocol fraction: " + text);
+			}
+			for (idx_t p = dot + 1; p < text.size(); p++) {
+				micros = micros * 10 + (text[p] - '0');
+			}
+			for (idx_t p = flen; p < 6; p++) {
+				micros *= 10;
+			}
+		}
+		if (hour > 24 || minute > 59 || second > 59 || (hour == 24 && (minute != 0 || second != 0 || micros != 0))) {
+			throw ConversionException("MySQL TIME text-protocol value out of range for TIME: " + text);
+		}
+		return Value::TIME(Time::FromTime(hour, minute, second, micros));
 	}
 	// Integer text cannot borrow DuckDB's permissive fractional/exponent casts.
 	// Type is selected from MYSQL_FIELD, never inferred from the cell contents.
@@ -140,20 +199,9 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 		// interval and can store ranges between -838:00:00 to 838:00:00
 		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
 	} else if (type_info.type_name == "timestamp") {
-		// in MySQL, "timestamp" columns are timezone aware while "datetime" columns
-		// are not, citing the docs:
-		//
-		// > If a column uses the TIMESTAMP data type, then any inserted values are
-		// > converted from the session's time zone to Coordinated Universal Time (UTC)
-		// > when stored, and converted back to the session's time zone when retrieved.
-		//
-		// Thus Incoming MySQL TIMESTAMP values have time zone offset already applied, and
-		// this offset is not available to us ('time_zone_displacement' field of MYSQL_TIME
-		// is always zero). So we cannot obtain the UTC (+00) timestamp from it, thus
-		// cannot use it to initialize the TIMESTAMP_TZ value which expects the UTC (+00)
-		// timestamp, so we are treating it as a 'local' (to server session time zone)
-		// timestamp.
-		return LogicalType::TIMESTAMP;
+		// Session connections pin time_zone='+00:00', so MySQL TIMESTAMP values
+		// are read and written in UTC and map to DuckDB TIMESTAMP_TZ.
+		return LogicalType::TIMESTAMP_TZ;
 	} else if (type_info.type_name == "year") {
 		return LogicalType::INTEGER;
 	} else if (type_info.type_name == "datetime" || type_info.type_name == "datetimev2") {
@@ -340,8 +388,9 @@ LogicalType MySQLTypes::ToMySQLType(const MySQLTypeConfig &type_config, const Lo
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS:
-	case LogicalTypeId::TIMESTAMP_TZ:
 		return LogicalType::TIMESTAMP;
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return LogicalType::TIMESTAMP_TZ;
 	case LogicalTypeId::HUGEINT:
 		return LogicalType::DOUBLE;
 	default:

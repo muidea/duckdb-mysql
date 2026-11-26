@@ -29,6 +29,7 @@ static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const My
 		case LogicalTypeId::FLOAT:
 		case LogicalTypeId::DATE:
 		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_TZ:
 		case LogicalTypeId::VARCHAR:
 			ltypes.push_back(lt);
 			break;
@@ -503,9 +504,10 @@ static void WriteDateTime(MySQLTypeConfig &type_config, MySQLField &f, Vector &v
 		break;
 	}
 	case LogicalTypeId::TIME: {
-		if (mt->hour < 0 || mt->hour > 24 ||
+		if (mt->neg != 0 || mt->hour > 24 || mt->minute > 59 || mt->second > 59 || mt->second_part > 999999 ||
 		    (mt->hour == 24 && (mt->minute > 0 || mt->second > 0 || mt->second_part > 0))) {
-			throw BinderException("time field value out of range, hour value: " + std::to_string(mt->hour));
+			throw ConversionException("time field value out of range: " + string(mt->neg ? "-" : "") +
+			                          std::to_string(mt->hour));
 		}
 		dtime_t val = Time::FromTime(mt->hour, mt->minute, mt->second, mt->second_part);
 		dtime_t *data = FlatVector::GetDataMutable<dtime_t>(vec);
@@ -518,6 +520,14 @@ static void WriteDateTime(MySQLTypeConfig &type_config, MySQLField &f, Vector &v
 		timestamp_t val = Timestamp::FromDatetime(dt, tm);
 		timestamp_t *data = FlatVector::GetDataMutable<timestamp_t>(vec);
 		data[row] = val;
+		break;
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		date_t dt = Date::FromDate(mt->year, mt->month, mt->day);
+		dtime_t tm = Time::FromTime(mt->hour, mt->minute, mt->second, mt->second_part);
+		timestamp_t val = Timestamp::FromDatetime(dt, tm);
+		timestamp_tz_t *data = FlatVector::GetDataMutable<timestamp_tz_t>(vec);
+		data[row] = timestamp_tz_t(val.value);
 		break;
 	}
 	default:

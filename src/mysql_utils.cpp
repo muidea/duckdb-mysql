@@ -1,9 +1,14 @@
 #include "mysql_source_error.hpp"
+#include "mysql_temporal_utils.hpp"
 #include "mysql_utils.hpp"
 
 #include <tuple>
 
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "storage/mysql_schema_entry.hpp"
 #include "storage/mysql_transaction.hpp"
@@ -322,6 +327,11 @@ MYSQL *MySQLUtils::Connect(const string &dsn, const string &attach_path) {
 		mysql_close(mysql);
 		throw IOException("%s", diagnostic);
 	}
+	if (mysql_query(mysql, "SET time_zone='+00:00'") != 0) {
+		auto diagnostic = MySQLQueryErrorMessage(mysql, nullptr, "source_connect");
+		mysql_close(mysql);
+		throw IOException("%s", diagnostic);
+	}
 	D_ASSERT(mysql == result);
 	return result;
 }
@@ -368,17 +378,76 @@ static string TransformBlobToMySQL(const string &val) {
 	return result;
 }
 
-string MySQLUtils::TransformConstant(const Value &val) {
+bool MySQLUtils::TryTransformConstant(const Value &val, string &out) {
+	if (val.IsNull()) {
+		out = "NULL";
+		return true;
+	}
 	if (val.type().IsNumeric() || val.type().id() == LogicalTypeId::BOOLEAN) {
-		return val.ToSQLString();
+		out = val.ToSQLString();
+		return true;
 	}
-	if (val.type().id() == LogicalTypeId::BLOB) {
-		return TransformBlobToMySQL(StringValue::Get(val));
+	switch (val.type().id()) {
+	case LogicalTypeId::BLOB:
+		out = TransformBlobToMySQL(StringValue::Get(val));
+		return true;
+	case LogicalTypeId::DATE: {
+		date_t dd = DateValue::Get(val);
+		if (!dd.IsFinite()) {
+			return false;
+		}
+		int32_t year, month, day;
+		Date::Convert(dd, year, month, day);
+		if (!IsMySQLDateYearInRange(year)) {
+			return false;
+		}
+		out = MySQLUtils::WriteLiteral(Date::ToString(dd));
+		return true;
 	}
-	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	case LogicalTypeId::TIME: {
+		dtime_t dt = TimeValue::Get(val);
+		if (dt.value < 0 || dt.value > Interval::MICROS_PER_DAY) {
+			return false;
+		}
+		out = MySQLUtils::WriteLiteral(Time::ToString(dt));
+		return true;
 	}
-	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	case LogicalTypeId::TIMESTAMP: {
+		timestamp_t ts = TimestampValue::Get(val);
+		if (!ts.IsFinite()) {
+			return false;
+		}
+		date_t dd;
+		dtime_t dt;
+		Timestamp::Convert(ts, dd, dt);
+		int32_t year, month, day;
+		Date::Convert(dd, year, month, day);
+		if (!IsMySQLDateYearInRange(year)) {
+			return false;
+		}
+		out = MySQLUtils::WriteLiteral(Timestamp::ToString(ts));
+		return true;
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		timestamp_t ts_utc = timestamp_t(TimestampTZValue::Get(val).value);
+		if (!ts_utc.IsFinite() || !IsMySQLTimestampUTCInRange(ts_utc.value)) {
+			return false;
+		}
+		out = MySQLUtils::WriteLiteral(Timestamp::ToString(ts_utc));
+		return true;
+	}
+	default:
+		out = val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+		return true;
+	}
+}
+
+string MySQLUtils::TransformConstant(const Value &val) {
+	string out;
+	if (!TryTransformConstant(val, out)) {
+		throw ConversionException("Temporal value \"%s\" is outside MySQL's supported range", val.ToString());
+	}
+	return out;
 }
 
 } // namespace duckdb

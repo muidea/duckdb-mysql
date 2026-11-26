@@ -220,7 +220,7 @@ static CanonicalPGType Canonical(const string &data_type, const string &column_t
         if (column_type != data_type && !ParenInt(column_type, data_type, precision)) return out;
         if (precision > 6 || !no_text) return out;
         if (data_type == "datetime") { out.name = "timestamp"; out.oid = 1114; out.typmod = precision; out.supported = true; }
-        else if (data_type == "timestamp") { out.name = "timestamptz"; out.oid = 1184; out.typmod = precision; out.supported = false; out.reason = "timezone_semantics_not_established"; }
+        else if (data_type == "timestamp") { out.name = "timestamptz"; out.oid = 1184; out.typmod = precision; out.supported = true; }
         else { out.name = "time"; out.oid = 1083; out.typmod = precision; out.supported = true; }
         return out;
     }
@@ -291,11 +291,12 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb, boo
     auto create=Query(c,"SHOW CREATE TABLE "+MySQLUtils::WriteIdentifier(d.schema)+"."+MySQLUtils::WriteIdentifier(d.table));
     if (!create->Next()) Reject(); auto ddl=StableCreate(create->GetString(1));
     string out="{\"database\":"+Quote(d.schema)+",\"table\":"+Quote(d.table)+",\"table_id\":"+Quote(id)+",\"create_sql\":"+Quote(ddl)+",\"columns\":[";
-    auto cols=Query(c,"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COALESCE(CHARACTER_SET_NAME,''),COALESCE(COLLATION_NAME,''),COALESCE(EXTRA,''),COALESCE(GENERATION_EXPRESSION,''),COLUMN_DEFAULT,CAST((SELECT COUNT(*) FROM information_schema.STATISTICS k WHERE k.TABLE_SCHEMA=c.TABLE_SCHEMA AND k.TABLE_NAME=c.TABLE_NAME AND k.INDEX_NAME='PRIMARY') AS CHAR),COALESCE(COLUMN_KEY,'') FROM information_schema.COLUMNS c WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 4097",args);
+    auto pk_count=Scalar(c,"SELECT CAST(COUNT(*) AS CHAR) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME='PRIMARY'",args);
+    auto cols=Query(c,"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COALESCE(CHARACTER_SET_NAME,''),COALESCE(COLLATION_NAME,''),COALESCE(EXTRA,''),COALESCE(GENERATION_EXPRESSION,''),COLUMN_DEFAULT,COALESCE(COLUMN_KEY,'') FROM information_schema.COLUMNS c WHERE TABLE_SCHEMA=? AND TABLE_NAME=? ORDER BY ORDINAL_POSITION LIMIT 4097",args);
     bool first=true;
     while(cols->Next()) {
         bool automatic=cols->GetString(6)=="auto_increment";
-        bool primary=cols->GetString(9)=="1" && cols->GetString(10)=="PRI";
+        bool primary=pk_count=="1" && cols->GetString(9)=="PRI";
         // Generated columns are source-maintained and must be omitted from
         // writes. Keep the table usable for its other columns; reject only an
         // actual reference to the generated column through write.supported.
@@ -326,7 +327,7 @@ static string Metadata(MySQLConnection &c,const Data &d, bool modern_innodb, boo
 }
 static string ErrorState(unsigned int code) {
     switch(code) {case 1062:return "23505"; case 1048:case 1364:return "23502"; case 1264:return "22003";
-    case 1406:return "22001"; case 1213:return "40P01"; case 1205:return "55P03"; case 1142:case 1143:case 1227:case 1044:case 1045:return "42501";
+    case 1292:return "22007"; case 1406:return "22001"; case 1213:return "40P01"; case 1205:case 3572:return "55P03"; case 1142:case 1143:case 1227:case 1044:case 1045:return "42501";
     case 1146:return "42P01"; case 1054:return "42703";
     case 2002:case 2003:case 2006:case 2013:case 2055:return "08006";
     default:return "HY000";}
@@ -376,8 +377,7 @@ static void Scan(ClientContext &ctx,TableFunctionInput &in,DataChunk &out) {
             ((comment == "Debian" || comment == "(Debian)" || lower_comment.find("debian") != string::npos) &&
              (lower_version.find("debian") != string::npos || lower_version.find("deb") != string::npos));
         bool mariadb_identity =
-            lower_comment.find("mariadb") != string::npos ||
-            (distribution && lower_version.find("mariadb") != string::npos);
+            lower_comment.find("mariadb") != string::npos || lower_version.find("mariadb") != string::npos;
         bool mysql_identity =
             !mariadb_identity && (distribution || comment.find("MySQL") != string::npos);
         if (Scalar(c,"SELECT DATABASE()")!=d.schema ||

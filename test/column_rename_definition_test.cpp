@@ -104,5 +104,58 @@ int main() {
 		throw std::runtime_error("missing column accepted");
 	} catch (const std::invalid_argument &) {
 	}
+
+	// SetNullability & ReplaceType / Modify preservation tests
+	auto null_test = MySQLRenameDefinition::Parse(
+	    "CREATE TABLE `t` (`a` int(11) DEFAULT NULL, `b` varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'NULL' COMMENT 'NOT NULL', `ts` timestamp(3) NULL DEFAULT NULL, `keep` bigint(20) NOT NULL DEFAULT 1)",
+	    "t");
+	auto a_nn = null_test;
+	a_nn.SetNullability("a", true);
+	Require(a_nn.columns[0].definition == "int(11) NOT NULL");
+	Require(a_nn.Modify("s", "t", "a") == "ALTER TABLE `s`.`t` MODIFY COLUMN `a` int(11) NOT NULL");
+	Require(null_test.PreservedOtherColumns(a_nn, "a"));
+
+	auto b_null = null_test;
+	b_null.SetNullability("b", false);
+	Require(b_null.columns[1].definition ==
+	        "varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NULL DEFAULT 'NULL' COMMENT 'NOT NULL'");
+	auto b_nn = b_null;
+	b_nn.SetNullability("b", true);
+	Require(b_nn.columns[1].definition ==
+	        "varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'NULL' COMMENT 'NOT NULL'");
+
+	auto ts_nn = null_test;
+	ts_nn.SetNullability("ts", true);
+	Require(ts_nn.columns[2].definition == "timestamp(3) NOT NULL");
+	auto ts_widen = null_test;
+	ts_widen.ReplaceType("ts", "TIMESTAMP(6)");
+	Require(ts_widen.columns[2].definition == "TIMESTAMP(6) NULL DEFAULT NULL");
+
+	auto widen = null_test;
+	widen.ReplaceType("b", "VARCHAR(64)");
+	Require(widen.columns[1].definition ==
+	        "VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'NULL' COMMENT 'NOT NULL'");
+	Require(widen.Modify("s", "t", "b") ==
+	        "ALTER TABLE `s`.`t` MODIFY COLUMN `b` VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'NULL' COMMENT 'NOT NULL'");
+
+	auto dec_def = MySQLRenameDefinition::Parse(
+	    "CREATE TABLE `t` (`n` decimal(10,2) NOT NULL DEFAULT '1.23', `u` int(11) unsigned NOT NULL)", "t");
+	dec_def.ReplaceType("n", "DECIMAL(18,2)");
+	Require(dec_def.columns[0].definition == "DECIMAL(18,2) NOT NULL DEFAULT '1.23'");
+	try {
+		dec_def.ReplaceType("u", "BIGINT");
+		throw std::runtime_error("unsigned ReplaceType accepted");
+	} catch (const std::invalid_argument &) {
+	}
+
+	auto bool_def = MySQLRenameDefinition::Parse(
+	    "CREATE TABLE `t` (`flag` tinyint(1) NOT NULL DEFAULT '1', `u` tinyint(1) unsigned NOT NULL)", "t");
+	Require(bool_def.Change("s", "t", "flag", "flag2") ==
+	        "ALTER TABLE `s`.`t` CHANGE COLUMN `flag` `flag2` BOOLEAN NOT NULL DEFAULT '1'");
+	Require(bool_def.Modify("s", "t", "flag") ==
+	        "ALTER TABLE `s`.`t` MODIFY COLUMN `flag` BOOLEAN NOT NULL DEFAULT '1'");
+	Require(bool_def.Modify("s", "t", "u") ==
+	        "ALTER TABLE `s`.`t` MODIFY COLUMN `u` tinyint(1) unsigned NOT NULL");
+
 	std::cout << "column rename definition preservation/bounds tests passed\n";
 }

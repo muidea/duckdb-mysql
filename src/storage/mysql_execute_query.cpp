@@ -4,10 +4,16 @@
 #include "storage/mysql_catalog.hpp"
 #include "storage/mysql_transaction.hpp"
 #include "mysql_connection.hpp"
+#include "mysql_filter_pushdown.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -83,13 +89,176 @@ InsertionOrderPreservingMap<string> MySQLExecuteQuery::ParamsToString() const {
 //===--------------------------------------------------------------------===//
 // Plan
 //===--------------------------------------------------------------------===//
+static vector<string> CollectOutputColumnNames(const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+		auto &table_scan = op.Cast<PhysicalTableScan>();
+		vector<string> out;
+		if (!table_scan.projection_ids.empty()) {
+			out.reserve(table_scan.projection_ids.size());
+			for (auto proj_idx : table_scan.projection_ids) {
+				if (proj_idx < table_scan.column_ids.size()) {
+					auto col_id = table_scan.column_ids[proj_idx].GetPrimaryIndex();
+					out.push_back(col_id == COLUMN_IDENTIFIER_ROW_ID
+					                  ? "rowid"
+					                  : (col_id < table_scan.names.size() ? table_scan.names[col_id] : ""));
+				} else {
+					out.emplace_back();
+				}
+			}
+		} else {
+			out.reserve(table_scan.column_ids.size());
+			for (const auto &col_index : table_scan.column_ids) {
+				auto col_id = col_index.GetPrimaryIndex();
+				out.push_back(col_id == COLUMN_IDENTIFIER_ROW_ID
+				                  ? "rowid"
+				                  : (col_id < table_scan.names.size() ? table_scan.names[col_id] : ""));
+			}
+		}
+		return out;
+	}
+	if (op.type == PhysicalOperatorType::FILTER && !op.children.empty()) {
+		return CollectOutputColumnNames(op.children[0].get());
+	}
+	if (op.type == PhysicalOperatorType::PROJECTION && !op.children.empty()) {
+		auto child_cols = CollectOutputColumnNames(op.children[0].get());
+		auto &proj = op.Cast<PhysicalProjection>();
+		vector<string> out;
+		out.reserve(proj.select_list.size());
+		for (const auto &expr : proj.select_list) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+				auto &ref = expr->Cast<BoundReferenceExpression>();
+				out.push_back(ref.Index() < child_cols.size() ? child_cols[ref.Index()]
+				                                              : expr->GetAlias().GetIdentifierName());
+			} else if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+				out.push_back(expr->GetAlias().GetIdentifierName());
+			} else {
+				out.emplace_back();
+			}
+		}
+		return out;
+	}
+	return {};
+}
+
+static string TransformFilterExpressionToMySQL(const Expression &expr, const vector<string> &column_names,
+                                               const string &statement) {
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto &comp = expr.Cast<BoundFunctionExpression>();
+		string op_str;
+		switch (comp.GetExpressionType()) {
+		case ExpressionType::COMPARE_EQUAL:
+			op_str = "=";
+			break;
+		case ExpressionType::COMPARE_NOTEQUAL:
+			op_str = "!=";
+			break;
+		case ExpressionType::COMPARE_LESSTHAN:
+			op_str = "<";
+			break;
+		case ExpressionType::COMPARE_GREATERTHAN:
+			op_str = ">";
+			break;
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+			op_str = "<=";
+			break;
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			op_str = ">=";
+			break;
+		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+			op_str = "<=>";
+			break;
+		default:
+			throw NotImplementedException("Unsupported comparison operator in MySQL %s filter", statement);
+		}
+		return "(" +
+		       TransformFilterExpressionToMySQL(BoundComparisonExpression::Left(comp), column_names, statement) +
+		       " " + op_str + " " +
+		       TransformFilterExpressionToMySQL(BoundComparisonExpression::Right(comp), column_names, statement) + ")";
+	}
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_CONSTANT: {
+		auto &bound_const = expr.Cast<BoundConstantExpression>();
+		return MySQLUtils::TransformConstant(bound_const.GetValue());
+	}
+	case ExpressionClass::BOUND_REF: {
+		auto &ref = expr.Cast<BoundReferenceExpression>();
+		string col_name;
+		if (ref.Index() < column_names.size() && !column_names[ref.Index()].empty()) {
+			col_name = column_names[ref.Index()];
+		} else if (!ref.GetAlias().empty()) {
+			col_name = ref.GetAlias().GetIdentifierName();
+		} else {
+			throw NotImplementedException("Unable to resolve column reference in MySQL %s filter", statement);
+		}
+		return MySQLUtils::WriteIdentifier(col_name);
+	}
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		auto &ref = expr.Cast<BoundColumnRefExpression>();
+		if (ref.GetAlias().empty()) {
+			throw NotImplementedException("Unable to resolve column reference in MySQL %s filter", statement);
+		}
+		return MySQLUtils::WriteIdentifier(ref.GetAlias().GetIdentifierName());
+	}
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		string op_str;
+		if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			op_str = " AND ";
+		} else if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+			op_str = " OR ";
+		} else {
+			throw NotImplementedException("Unsupported conjunction in MySQL %s filter", statement);
+		}
+		const auto &children = conj.GetChildren();
+		if (children.empty()) {
+			throw NotImplementedException("Empty conjunction in MySQL %s filter", statement);
+		}
+		vector<string> parts;
+		parts.reserve(children.size());
+		for (const auto &child : children) {
+			parts.push_back(TransformFilterExpressionToMySQL(*child, column_names, statement));
+		}
+		return "(" + StringUtil::Join(parts, op_str) + ")";
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op_expr = expr.Cast<BoundOperatorExpression>();
+		const auto &children = op_expr.GetChildren();
+		if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL && children.size() == 1) {
+			return "(" + TransformFilterExpressionToMySQL(*children[0], column_names, statement) + " IS NULL)";
+		}
+		if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL && children.size() == 1) {
+			return "(" + TransformFilterExpressionToMySQL(*children[0], column_names, statement) + " IS NOT NULL)";
+		}
+		if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_NOT && children.size() == 1) {
+			return "(NOT " + TransformFilterExpressionToMySQL(*children[0], column_names, statement) + ")";
+		}
+		if ((op_expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+		     op_expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) &&
+		    children.size() >= 2) {
+			string lhs = TransformFilterExpressionToMySQL(*children[0], column_names, statement);
+			vector<string> items;
+			items.reserve(children.size() - 1);
+			for (idx_t i = 1; i < children.size(); i++) {
+				items.push_back(TransformFilterExpressionToMySQL(*children[i], column_names, statement));
+			}
+			string neg = op_expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN ? " NOT IN (" : " IN (";
+			return "(" + lhs + neg + StringUtil::Join(items, ", ") + "))";
+		}
+		throw NotImplementedException("Unsupported operator in MySQL %s filter", statement);
+	}
+	default:
+		throw NotImplementedException("Unsupported filter expression in MySQL %s statement", statement);
+	}
+}
+
 string ExtractFilters(PhysicalOperator &child, const string &statement) {
 	// FIXME - all of this is pretty gnarly, we should provide a hook earlier on
 	// in the planning process to convert this into a SQL statement
 	if (child.type == PhysicalOperatorType::FILTER) {
 		auto &filter = child.Cast<PhysicalFilter>();
 		auto result = ExtractFilters(child.children[0], statement);
-		auto filter_str = filter.expression->ToString();
+		auto filter_cols = CollectOutputColumnNames(child.children[0].get());
+		auto filter_str = TransformFilterExpressionToMySQL(*filter.expression, filter_cols, statement);
 		if (result.empty()) {
 			return filter_str;
 		} else {
@@ -119,18 +288,19 @@ string ExtractFilters(PhysicalOperator &child, const string &statement) {
 		for (auto &entry : *table_scan.table_filters) {
 			auto column_index = entry.GetIndex().GetIndexUnsafe();
 			auto &filter = entry.Filter();
-			string column_name;
-			if (column_index < table_scan.names.size()) {
-				const auto col_id = table_scan.column_ids[column_index].GetPrimaryIndex();
-				if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
-					column_name = "rowid";
-				} else {
-					column_name = table_scan.names[col_id];
-				}
+			if (column_index >= table_scan.column_ids.size()) {
+				throw NotImplementedException("Unsupported filter column index in MySQL %s statement", statement);
 			}
-			BoundReferenceExpression bound_ref(Identifier(std::move(column_name)), LogicalTypeId::INVALID, 0);
-			auto filter_expr = filter.ToExpression(bound_ref);
-			auto filter_str = filter_expr->ToString();
+			const auto col_id = table_scan.column_ids[column_index].GetPrimaryIndex();
+			if (col_id == COLUMN_IDENTIFIER_ROW_ID || col_id >= table_scan.names.size()) {
+				throw NotImplementedException("Unsupported filter column in MySQL %s statement", statement);
+			}
+			string escaped_col = MySQLUtils::WriteIdentifier(table_scan.names[col_id]);
+			auto filter_str = MySQLFilterPushdown::TransformFilter(escaped_col, const_cast<TableFilter &>(filter));
+			if (filter_str.empty()) {
+				throw NotImplementedException("Unsupported filter on column \"%s\" in MySQL %s statement",
+				                              table_scan.names[col_id], statement);
+			}
 			if (result.empty()) {
 				result = std::move(filter_str);
 			} else {

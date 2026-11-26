@@ -47,7 +47,16 @@ static string TransformFilterExpr(const string &column_name, const Expression &e
 		} else {
 			return string();
 		}
-		auto constant_string = MySQLUtils::TransformConstant(*constant);
+		if (cmp_type != ExpressionType::COMPARE_EQUAL && cmp_type != ExpressionType::COMPARE_NOTEQUAL &&
+		    cmp_type != ExpressionType::COMPARE_LESSTHAN && cmp_type != ExpressionType::COMPARE_GREATERTHAN &&
+		    cmp_type != ExpressionType::COMPARE_LESSTHANOREQUALTO &&
+		    cmp_type != ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+			return string();
+		}
+		string constant_string;
+		if (!MySQLUtils::TryTransformConstant(*constant, constant_string)) {
+			return string();
+		}
 		auto operator_string = MySQLFilterPushdown::TransformComparison(cmp_type);
 		return StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	}
@@ -69,15 +78,23 @@ static string TransformFilterExpr(const string &column_name, const Expression &e
 		case ExpressionType::OPERATOR_IS_NOT_NULL:
 			return column_name + " IS NOT NULL";
 		case ExpressionType::COMPARE_IN: {
+			if (children.size() <= 1) {
+				return string();
+			}
 			string in_list;
 			for (idx_t i = 1; i < children.size(); i++) {
 				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 					return string();
 				}
+				string constant_string;
+				if (!MySQLUtils::TryTransformConstant(children[i]->Cast<BoundConstantExpression>().GetValue(),
+				                                      constant_string)) {
+					return string();
+				}
 				if (!in_list.empty()) {
 					in_list += ", ";
 				}
-				in_list += MySQLUtils::TransformConstant(children[i]->Cast<BoundConstantExpression>().GetValue());
+				in_list += constant_string;
 			}
 			return column_name + " IN (" + in_list + ")";
 		}
@@ -136,17 +153,34 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 }
 
 string MySQLFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
-                                             const vector<string> &names) {
+                                             const vector<string> &names, vector<column_t> *unpushed_columns) {
 	if (!filters || !filters->HasFilters()) {
 		// no filters
 		return string();
 	}
 	string result;
 	for (auto &entry : *filters) {
-		auto column_name = MySQLUtils::WriteIdentifier(names[column_ids[entry.GetIndex().GetIndexUnsafe()]]);
+		auto filter_col_idx = entry.GetIndex().GetIndexUnsafe();
+		if (filter_col_idx >= column_ids.size()) {
+			if (unpushed_columns) {
+				unpushed_columns->push_back(filter_col_idx);
+			}
+			continue;
+		}
+		auto col_idx = column_ids[filter_col_idx];
+		if (col_idx == COLUMN_IDENTIFIER_ROW_ID || col_idx >= names.size()) {
+			if (unpushed_columns) {
+				unpushed_columns->push_back(filter_col_idx);
+			}
+			continue;
+		}
+		auto column_name = MySQLUtils::WriteIdentifier(names[col_idx]);
 		auto &filter = entry.Filter();
 		auto new_filter = TransformFilter(column_name, const_cast<TableFilter &>(filter));
 		if (new_filter.empty()) {
+			if (unpushed_columns) {
+				unpushed_columns->push_back(filter_col_idx);
+			}
 			continue;
 		}
 		if (!result.empty()) {

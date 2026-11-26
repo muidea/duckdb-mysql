@@ -1,5 +1,6 @@
 #include "mysql_source_error.hpp"
 #include "mysql_connection_pool.hpp"
+#include "mysql_temporal_utils.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -74,6 +75,10 @@ void MySQLConnectionPool::ResetConnection(MySQLConnection &conn) {
 	const char *charset = mysql_character_set_name(mysql_conn);
 	if (strcmp(charset, "utf8mb4") != 0) {
 		throw IOException("Character set verification failed: expected utf8mb4, got %s", charset);
+	}
+
+	if (mysql_query(mysql_conn, "SET time_zone='+00:00'") != 0) {
+		throw IOException("%s", MySQLQueryErrorMessage(mysql_conn, nullptr, "source_connect"));
 	}
 }
 
@@ -204,6 +209,11 @@ dbconnector::pool::ConnectionPoolConfig MySQLConnectionPool::CreateConfig(Client
 
 MySQLPooledConnection MySQLConnectionPool::Acquire(dbconnector::pool::AcquireMode acquire_mode,
                                                    const std::string &time_zone) {
+	if (!IsAllowedMySQLSessionTimeZone(time_zone)) {
+		throw InvalidInputException(
+		    "mysql_session_time_zone must remain UTC ('+00:00' or empty); non-UTC session time zones would diverge "
+		    "from UTC TIMESTAMP encoding. Set DuckDB/client TimeZone instead.");
+	}
 	MySQLPooledConnection pc;
 	switch (acquire_mode) {
 	case dbconnector::pool::AcquireMode::FORCE:
@@ -218,15 +228,6 @@ MySQLPooledConnection MySQLConnectionPool::Acquire(dbconnector::pool::AcquireMod
 			throw IOException("Connection pool exhausted: no connections available (try mode)");
 		}
 		break;
-	}
-
-	if (!time_zone.empty()) {
-		try {
-			pc->Execute("SET TIME_ZONE = ?", {Value(time_zone)});
-		} catch (...) {
-			pc.Invalidate();
-			throw;
-		}
 	}
 
 	return pc;

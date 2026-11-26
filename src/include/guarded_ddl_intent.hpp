@@ -7,13 +7,23 @@
 // field. This initial native surface intentionally excludes conditional DDL,
 // ONLY/inheritance, implicit column attributes and non-equivalent conversions.
 namespace duckdb {
+struct DDLColumnSpec {
+	string name, type;
+	int32_t length = 0, precision = 0, scale = 0;
+	bool not_null = false;
+	string default_kind, default_value;
+	bool primary_key = false;
+	bool unique = false;
+	string native_type;
+};
+
 struct GuardedDDLIntent {
 	int32_t contract_version = 2;
 	bool conditional = false;
 	bool has_check_constraint = false;
 	string database, schema, operation, action, name, index, owner, new_name, column_name, query_sql, sql;
 	vector<string> columns, constraints, keys;
-	vector<pair<string, string>> column_specs;
+	vector<DDLColumnSpec> column_specs;
 	string default_kind, default_value, constraint_name, constraint_kind, check_column, check_operator, check_value,
 	    reference_schema, reference_table, identity_mode;
 	vector<string> constraint_keys, reference_keys;
@@ -48,13 +58,20 @@ struct GuardedDDLIntent {
 				throw BinderException("DDL numeric precision/scale is unsupported");
 			return "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
 		}
-		if (type == "timestamp" || type == "time" || (!mysql && type == "timestamptz")) {
+		if (type == "timestamp" || type == "timestamptz" || type == "time") {
 			if (length || precision < 0 || precision > 6 || scale)
 				throw BinderException("DDL temporal precision is unsupported");
-			if (!mysql && type == "timestamptz")
+			if (mysql) {
+				if (type == "timestamp")
+					return "DATETIME(" + std::to_string(precision) + ")";
+				if (type == "timestamptz")
+					return "TIMESTAMP(" + std::to_string(precision) + ")";
+				return "TIME(" + std::to_string(precision) + ")";
+			}
+			if (type == "timestamptz")
 				return "TIMESTAMP(" + std::to_string(precision) + ") WITH TIME ZONE";
-			return string(type == "time" ? "TIME(" : (mysql ? "DATETIME(" : "TIMESTAMP(")) +
-			       std::to_string(precision) + ")" + (mysql ? "" : " WITHOUT TIME ZONE");
+			return string(type == "time" ? "TIME(" : "TIMESTAMP(") + std::to_string(precision) +
+			       ") WITHOUT TIME ZONE";
 		}
 		if (precision || scale)
 			throw BinderException("DDL unexpected type modifiers");
@@ -186,20 +203,26 @@ struct GuardedDDLIntent {
 				throw BinderException("DDL duplicate column is invalid");
 			seen.push_back(n);
 			auto length = cv[2].GetValue<int32_t>();
-			string native, extra_col;
+			DDLColumnSpec spec;
+			spec.name = n;
+			spec.type = type;
+			spec.length = length;
+			string extra_col;
 			if (contract == 5 || contract == 6) {
 				if (ct[3].first != "precision" || ct[4].first != "scale" || cv[3].IsNull() || cv[4].IsNull() ||
 				    cv[3].type().id() != LogicalTypeId::INTEGER || cv[4].type().id() != LogicalTypeId::INTEGER)
 					throw BinderException("DDL numeric/time modifiers are invalid");
-				native = ColumnTypeV5(type, length, cv[3].GetValue<int32_t>(), cv[4].GetValue<int32_t>(), mysql);
+				spec.precision = cv[3].GetValue<int32_t>();
+				spec.scale = cv[4].GetValue<int32_t>();
+				spec.native_type = ColumnTypeV5(type, length, spec.precision, spec.scale, mysql);
 			} else if (type == "smallint" || type == "integer" || type == "bigint") {
 				if (length)
 					throw BinderException("DDL column length is invalid");
-				native = type;
+				spec.native_type = type;
 			} else if (type == "varchar" && length >= 1 && length <= (mysql ? 16383 : 10485760)) {
-				native = "VARCHAR(" + std::to_string(length) + ")";
+				spec.native_type = "VARCHAR(" + std::to_string(length) + ")";
 			} else if (type == "text" && !mysql && !length) {
-				native = "TEXT";
+				spec.native_type = "TEXT";
 			} else {
 				throw BinderException("DDL column type is unsupported");
 			}
@@ -209,20 +232,39 @@ struct GuardedDDLIntent {
 				    cv[9].IsNull() || cv[5].type().id() != LogicalTypeId::BOOLEAN ||
 				    cv[8].type().id() != LogicalTypeId::BOOLEAN || cv[9].type().id() != LogicalTypeId::BOOLEAN)
 					throw BinderException("DDL v6 column modifiers are invalid");
-				if (cv[5].GetValue<bool>())
-					extra_col += " NOT NULL";
-				string dk = Text(cv[6]), dv = Text(cv[7]);
-				if (!dk.empty())
-					extra_col += " DEFAULT " + DefaultLiteralSQL(dk, dv, mysql);
-				else if (!dv.empty())
+				spec.not_null = cv[5].GetValue<bool>();
+				spec.default_kind = Text(cv[6]);
+				spec.default_value = Text(cv[7]);
+				spec.primary_key = cv[8].GetValue<bool>();
+				spec.unique = cv[9].GetValue<bool>();
+				if (spec.default_kind.empty() && !spec.default_value.empty())
 					throw BinderException("DDL column default kind is missing");
-				if (cv[8].GetValue<bool>())
+				if ((spec.not_null || spec.primary_key) && spec.default_kind == "null")
+					throw BinderException("DDL NOT NULL column cannot default to NULL");
+				if (spec.not_null)
+					extra_col += " NOT NULL";
+				if (!spec.default_kind.empty()) {
+					if (spec.default_kind == "null") {
+						extra_col += (mysql ? " NULL DEFAULT NULL" : " DEFAULT NULL");
+					} else {
+						if (mysql && spec.type == "timestamptz" && !spec.not_null && !spec.primary_key)
+							extra_col += " NULL";
+						extra_col += " DEFAULT " + DefaultLiteralSQL(spec.default_kind, spec.default_value, mysql);
+					}
+				} else if (mysql && spec.type == "timestamptz" && !spec.not_null && !spec.primary_key) {
+					// Avoid MySQL 5.7 implicit NOT NULL DEFAULT CURRENT_TIMESTAMP promotion.
+					extra_col += " NULL DEFAULT NULL";
+				}
+				if (spec.primary_key)
 					extra_col += " PRIMARY KEY";
-				if (cv[9].GetValue<bool>())
+				if (spec.unique)
 					extra_col += " UNIQUE";
+			} else if (mysql && spec.type == "timestamptz" &&
+			           (d.action == "create_table" || d.action == "add_column")) {
+				extra_col += " NULL DEFAULT NULL";
 			}
-			d.columns.push_back(quote(n) + " " + native + extra_col);
-			d.column_specs.emplace_back(n, native);
+			d.columns.push_back(quote(n) + " " + spec.native_type + extra_col);
+			d.column_specs.push_back(std::move(spec));
 		}
 		if (contract == 6) {
 			if (fields[9].type().id() != LogicalTypeId::LIST)
@@ -364,12 +406,12 @@ struct GuardedDDLIntent {
 		} else if (d.action == "alter_column_type") {
 			if (d.columns.size() != 1 || d.column_specs.size() != 1 || !d.keys.empty() || !d.index.empty() ||
 			    !d.owner.empty() || !d.new_name.empty() || d.column_name.empty() ||
-			    d.column_specs[0].first != d.column_name)
+			    d.column_specs[0].name != d.column_name)
 				throw BinderException("DDL alter column type options are invalid");
 			d.sql = mysql
 			            ? ("ALTER TABLE " + target + " MODIFY COLUMN " + d.columns[0])
 			            : ("ALTER TABLE ONLY " + target + " ALTER COLUMN " + quote(d.column_name) + " TYPE " +
-			               d.column_specs[0].second);
+			               d.column_specs[0].native_type);
 		} else if (d.action == "create_schema") {
 			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty() ||
 			    !d.new_name.empty() || !d.column_name.empty() || d.name != d.schema)

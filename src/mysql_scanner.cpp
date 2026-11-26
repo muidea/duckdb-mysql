@@ -243,6 +243,73 @@ static string BuildFilterString(const FederationState &fed) {
 	}
 }
 
+static void AppendLocalColumnFilterExpr(const MySQLBindData &bind_data, const vector<column_t> &column_ids,
+                                        optional_ptr<TableFilterSet> filters, column_t output_col_idx,
+                                        vector<unique_ptr<Expression>> &local_exprs) {
+	if (!filters || output_col_idx >= column_ids.size()) {
+		return;
+	}
+	auto matched_filter = filters->TryGetFilterByColumnIndex(ProjectionIndex(output_col_idx));
+	if (!matched_filter) {
+		return;
+	}
+	auto actual_table_col = column_ids[output_col_idx];
+	if (actual_table_col == COLUMN_IDENTIFIER_ROW_ID) {
+		return;
+	}
+	auto &col = bind_data.table.GetColumn(LogicalIndex(actual_table_col));
+	auto col_ref = make_uniq<BoundReferenceExpression>(col.GetType(), output_col_idx);
+	auto expr = matched_filter->ToExpression(*col_ref);
+	if (expr) {
+		local_exprs.push_back(std::move(expr));
+	}
+}
+
+static void FinalizeLocalFilterExpression(FederationState &fed, vector<unique_ptr<Expression>> &local_exprs) {
+	if (local_exprs.size() == 1) {
+		fed.local_filter_expression = std::move(local_exprs[0]);
+	} else if (local_exprs.size() > 1) {
+		auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+		for (auto &expr : local_exprs) {
+			conjunction->GetChildrenMutable().push_back(std::move(expr));
+		}
+		fed.local_filter_expression = std::move(conjunction);
+	}
+}
+
+static void SanitizeExecutionPlanForUnpushableFilters(FederationState &fed) {
+	bool has_unpushable = false;
+	const idx_t n = fed.filter_analysis.analyses.size();
+	for (idx_t i = 0; i < n; i++) {
+		if (fed.filter_analysis.analyses[i].mysql_predicate.empty()) {
+			has_unpushable = true;
+			break;
+		}
+	}
+	if (!has_unpushable) {
+		return;
+	}
+	vector<idx_t> sanitized_pushed;
+	vector<bool> is_pushed(n, false);
+	for (auto idx : fed.execution_plan.pushed_filter_indices) {
+		if (idx < n && !fed.filter_analysis.analyses[idx].mysql_predicate.empty() && !is_pushed[idx]) {
+			sanitized_pushed.push_back(idx);
+			is_pushed[idx] = true;
+		}
+	}
+	vector<idx_t> sanitized_local;
+	for (idx_t i = 0; i < n; i++) {
+		if (!is_pushed[i]) {
+			sanitized_local.push_back(i);
+		}
+	}
+	fed.execution_plan.pushed_filter_indices = std::move(sanitized_pushed);
+	fed.execution_plan.local_filter_indices = std::move(sanitized_local);
+	fed.execution_plan.strategy = fed.execution_plan.pushed_filter_indices.empty()
+	                                  ? ExecutionStrategy::EXECUTE_ALL_LOCALLY
+	                                  : ExecutionStrategy::HYBRID;
+}
+
 static void BuildLocalFilterExpression(FederationState &fed, const MySQLBindData &bind_data,
                                        const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters) {
 	if ((fed.execution_plan.strategy != ExecutionStrategy::HYBRID &&
@@ -256,41 +323,24 @@ static void BuildLocalFilterExpression(FederationState &fed, const MySQLBindData
 		if (filter_idx >= fed.filter_analysis.analyses.size()) {
 			continue;
 		}
-		const auto &analysis = fed.filter_analysis.analyses[filter_idx];
-		column_t output_col_idx = analysis.column_index;
-
-		optional_ptr<const TableFilter> matched_filter;
-		for (const auto &entry : *filters) {
-			if (entry.GetIndex().GetIndexUnsafe() == output_col_idx) {
-				matched_filter = &entry.Filter();
-				break;
-			}
-		}
-		if (!matched_filter) {
-			continue;
-		}
-		if (output_col_idx >= column_ids.size()) {
-			continue;
-		}
-		auto actual_table_col = column_ids[output_col_idx];
-		auto &col = bind_data.table.GetColumn(LogicalIndex(actual_table_col));
-
-		auto col_ref = make_uniq<BoundReferenceExpression>(col.GetType(), output_col_idx);
-		auto expr = matched_filter->ToExpression(*col_ref);
-		if (expr) {
-			local_exprs.push_back(std::move(expr));
-		}
+		AppendLocalColumnFilterExpr(bind_data, column_ids, filters, fed.filter_analysis.analyses[filter_idx].column_index,
+		                            local_exprs);
 	}
+	FinalizeLocalFilterExpression(fed, local_exprs);
+}
 
-	if (local_exprs.size() == 1) {
-		fed.local_filter_expression = std::move(local_exprs[0]);
-	} else if (local_exprs.size() > 1) {
-		auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-		for (auto &expr : local_exprs) {
-			conjunction->GetChildrenMutable().push_back(std::move(expr));
-		}
-		fed.local_filter_expression = std::move(conjunction);
+static void BuildLocalFilterExpressionFromColumns(FederationState &fed, const MySQLBindData &bind_data,
+                                                  const vector<column_t> &column_ids,
+                                                  optional_ptr<TableFilterSet> filters,
+                                                  const vector<column_t> &unpushed_columns) {
+	if (unpushed_columns.empty()) {
+		return;
 	}
+	vector<unique_ptr<Expression>> local_exprs;
+	for (auto output_col_idx : unpushed_columns) {
+		AppendLocalColumnFilterExpr(bind_data, column_ids, filters, output_col_idx, local_exprs);
+	}
+	FinalizeLocalFilterExpression(fed, local_exprs);
 }
 
 static void InjectQueryHints(ClientContext &context, string &select, const FederationState &fed,
@@ -505,12 +555,16 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 
 				ResolveExecutionPlan(context, fed, bind_data, stats_collector, mysql_catalog, con, column_names,
 				                     cache_key);
+				SanitizeExecutionPlanForUnpushableFilters(fed);
 				ResolvePartitionPruning(fed, bind_data, stats_collector, input.column_ids, input.filters);
 
 				filter_string = BuildFilterString(fed);
 				BuildLocalFilterExpression(fed, bind_data, input.column_ids, input.filters);
 			} else {
-				filter_string = MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
+				vector<column_t> unpushed_columns;
+				filter_string = MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names,
+				                                                      &unpushed_columns);
+				BuildLocalFilterExpressionFromColumns(fed, bind_data, input.column_ids, input.filters, unpushed_columns);
 			}
 		} catch (std::bad_alloc &) {
 			throw;
@@ -519,10 +573,16 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 			Printer::Print(StringUtil::Format("MySQL federation: falling back to simple pushdown (%s)", e.what()));
 #endif
 			fed = FederationState();
-			filter_string = MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
+			vector<column_t> unpushed_columns;
+			filter_string = MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names,
+			                                                      &unpushed_columns);
+			BuildLocalFilterExpressionFromColumns(fed, bind_data, input.column_ids, input.filters, unpushed_columns);
 		}
 	} else {
-		filter_string = MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
+		vector<column_t> unpushed_columns;
+		filter_string =
+		    MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names, &unpushed_columns);
+		BuildLocalFilterExpressionFromColumns(fed, bind_data, input.column_ids, input.filters, unpushed_columns);
 	}
 
 	if (!use_text_protocol && bind_data.use_predicate_analyzer && !fed.partition_clause.empty()) {
@@ -613,7 +673,8 @@ static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChun
 			case LogicalTypeId::BLOB:
 			case LogicalTypeId::DATE:
 			case LogicalTypeId::TIME:
-			case LogicalTypeId::TIMESTAMP: {
+			case LogicalTypeId::TIMESTAMP:
+			case LogicalTypeId::TIMESTAMP_TZ: {
 				if (output_vec.GetType() == res_vec.GetType()) {
 					VectorOperations::Copy(res_vec, output_vec, res_chunk.size(), 0, 0);
 				} else if (output_vec.GetType().id() == LogicalTypeId::BLOB &&

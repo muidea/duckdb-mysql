@@ -5,6 +5,7 @@
 #include "mysql_scanner.hpp"
 #include "mysql_storage.hpp"
 #include "mysql_scanner_extension.hpp"
+#include "mysql_temporal_utils.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -61,6 +62,18 @@ static unique_ptr<FunctionData> BindExactDecimalKey(BindScalarFunctionInput &inp
 
 static void SetMySQLDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
 	MySQLConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
+}
+
+static void SetMySQLSessionTimeZone(ClientContext &context, SetScope scope, Value &parameter) {
+	if (!parameter.IsNull()) {
+		auto tz = parameter.ToString();
+		if (!IsAllowedMySQLSessionTimeZone(tz)) {
+			throw InvalidInputException(
+			    "mysql_session_time_zone must remain UTC ('+00:00' or empty); non-UTC session time zones would diverge "
+			    "from UTC TIMESTAMP encoding. Set DuckDB/client TimeZone instead.");
+		}
+	}
+	MySQLClearCacheFunction::ClearCacheOnSetting(context, scope, parameter);
 }
 
 template <typename Fn>
@@ -284,11 +297,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("mysql_bit1_as_boolean", "Whether or not to convert BIT(1) columns to BOOLEAN",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), MySQLClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("mysql_session_time_zone",
-	                          "Value to use as a session time zone for newly opened"
-	                          " connections to MySQL server",
-	                          LogicalType::VARCHAR, Value(""), MySQLClearCacheFunction::ClearCacheOnSetting);
+	                          "Session time zone for MySQL connections (locked to UTC / '+00:00')",
+	                          LogicalType::VARCHAR, Value(""), SetMySQLSessionTimeZone);
 	config.AddExtensionOption("mysql_time_as_time", "Whether or not to convert MySQL's TIME columns to DuckDB's TIME",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false),
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true),
 	                          MySQLClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("mysql_incomplete_dates_as_nulls",
 	                          "Whether to return DATEs with zero month or day as NULLs", LogicalType::BOOLEAN,

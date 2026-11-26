@@ -172,8 +172,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		    ((comment == "Debian" || comment == "(Debian)" || lower_comment.find("debian") != string::npos) &&
 		     (lower_version.find("debian") != string::npos || lower_version.find("deb") != string::npos));
 		bool mariadb_identity =
-		    lower_comment.find("mariadb") != string::npos ||
-		    (distribution && lower_version.find("mariadb") != string::npos);
+		    lower_comment.find("mariadb") != string::npos || lower_version.find("mariadb") != string::npos;
 		bool mysql_identity =
 		    !mariadb_identity && (distribution || comment.find("MySQL") != string::npos);
 		if ((mariadb ? !mariadb_identity : !mysql_identity) ||

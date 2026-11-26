@@ -11,7 +11,12 @@
 
 #include "mysql_connection.hpp"
 #include "mysql_scanner.hpp"
+#include "mysql_temporal_utils.hpp"
 #include "mysql_types.hpp"
+
+#include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "storage/mysql_catalog.hpp"
 #include "storage/mysql_transaction.hpp"
@@ -159,10 +164,67 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 	gstate.varchar_chunk.Reset();
 	for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
 		switch (chunk.data[c].GetType().id()) {
+		case LogicalTypeId::DATE: {
+			auto date_data = FlatVector::GetData<date_t>(chunk.data[c]);
+			for (idx_t r = 0; r < chunk.size(); r++) {
+				if (FlatVector::IsNull(chunk.data[c], r)) {
+					continue;
+				}
+				if (!date_data[r].IsFinite()) {
+					throw ConversionException("Non-finite DATE value \"%s\" is outside MySQL's supported range",
+					                          Date::ToString(date_data[r]));
+				}
+				int32_t year, month, day;
+				Date::Convert(date_data[r], year, month, day);
+				if (!IsMySQLDateYearInRange(year)) {
+					throw ConversionException(
+					    "DATE value \"%s\" is outside MySQL's supported range (0001-01-01..9999-12-31)",
+					    Date::ToString(date_data[r]));
+				}
+			}
+			VectorOperations::Cast(context.client, chunk.data[c], gstate.varchar_chunk.data[c], chunk.size());
+			break;
+		}
+		case LogicalTypeId::TIMESTAMP: {
+			auto ts_data = FlatVector::GetData<timestamp_t>(chunk.data[c]);
+			for (idx_t r = 0; r < chunk.size(); r++) {
+				if (FlatVector::IsNull(chunk.data[c], r)) {
+					continue;
+				}
+				if (!ts_data[r].IsFinite()) {
+					throw ConversionException("Non-finite TIMESTAMP value \"%s\" is outside MySQL's supported range",
+					                          Timestamp::ToString(ts_data[r]));
+				}
+				date_t dd;
+				dtime_t dt;
+				Timestamp::Convert(ts_data[r], dd, dt);
+				int32_t year, month, day;
+				Date::Convert(dd, year, month, day);
+				if (!IsMySQLDateYearInRange(year)) {
+					throw ConversionException(
+					    "TIMESTAMP value \"%s\" is outside MySQL's supported range (0001-01-01..9999-12-31)",
+					    Timestamp::ToString(ts_data[r]));
+				}
+			}
+			VectorOperations::Cast(context.client, chunk.data[c], gstate.varchar_chunk.data[c], chunk.size());
+			break;
+		}
 		case LogicalTypeId::BLOB:
 			MySQLCastBlob(chunk.data[c], gstate.varchar_chunk.data[c], chunk.size());
 			break;
 		case LogicalTypeId::TIMESTAMP_TZ: {
+			auto tstz_data = FlatVector::GetData<timestamp_tz_t>(chunk.data[c]);
+			for (idx_t r = 0; r < chunk.size(); r++) {
+				if (FlatVector::IsNull(chunk.data[c], r)) {
+					continue;
+				}
+				timestamp_t ts_utc(tstz_data[r].value);
+				if (!ts_utc.IsFinite() || !IsMySQLTimestampUTCInRange(ts_utc.value)) {
+					throw ConversionException("TIMESTAMPTZ value \"%s\" is outside MySQL TIMESTAMP range "
+					                          "(1970-01-01 00:00:01..2038-01-19 03:14:07.999999 UTC)",
+					                          Timestamp::ToString(ts_utc));
+				}
+			}
 			Vector timestamp_vector(LogicalType::TIMESTAMP);
 			timestamp_vector.Reinterpret(chunk.data[c]);
 			VectorOperations::Cast(context.client, timestamp_vector, gstate.varchar_chunk.data[c], chunk.size());
